@@ -2,22 +2,22 @@
 
 ## 1. Resource Fabric
 
-The Resource Fabric represents available computational resources independently of physical machines.
+The Resource Fabric represents available capabilities independently of physical machines.
 
 ```
 Participant A ──┐
-Participant B ──┼── Resource Fabric ── Logical Node
+Participant B ──┼── Resource Fabric ── Scheduler ── Logical Node
 Participant C ──┤
 Participant D ──┘
 ```
 
-A participant can contribute a small resource fragment for a limited lifetime.
+A participant can contribute a small resource fragment for a bounded lifetime.
 
 ## 2. Resource Fragment
 
-A fragment describes a bounded capability rather than exposing an entire machine.
+A fragment describes a bounded contribution rather than exposing an entire machine.
 
-Examples:
+Example:
 
 - 0.07 CPU cores
 - 128 MiB memory
@@ -25,19 +25,34 @@ Examples:
 - 2 Mbps network capacity
 - 15 minute lifetime
 
-## 3. Logical Nodes
+Fragments are additive for allocation purposes, but they do not imply shared memory or shared CPU semantics.
 
-A Logical Node is an allocation of capabilities selected from the fabric.
+## 3. Multi-participant allocation
+
+A logical node may be backed by several participants:
+
+```
+Logical Node X
+├── Participant A: 20%
+├── Participant B: 30%
+└── Participant C: 50%
+```
+
+If a participant leaves, the scheduler can reconstruct the allocation from the remaining fabric when the workload permits it.
+
+## 4. Logical Nodes
+
+A Logical Node is an abstract execution allocation.
 
 Its identity is independent of the physical participants currently backing it.
 
-If a participant disappears, the scheduler can replace the lost allocation when possible.
+The node records its contributing allocations so that the control plane can reason about placement, ownership, lifetime, and recovery.
 
-## 4. Scheduler
+## 5. Scheduler
 
-The scheduler matches workload requirements against capabilities.
+The scheduler matches workload requirements against the capabilities visible in the fabric.
 
-It should answer:
+It asks:
 
 > Which set of capabilities can execute this workload?
 
@@ -45,30 +60,34 @@ rather than:
 
 > Which server should run this workload?
 
-## 5. Runtime
+The first scheduler implementation is deliberately simple and deterministic. More advanced policies can later consider topology, latency, reliability, trust, energy, locality, GPU capability, and cost.
+
+## 6. Runtime
 
 The runtime executes workloads against logical resources.
 
-The initial architecture keeps the runtime abstract so multiple execution models can be introduced without changing the resource fabric.
+The runtime is intentionally abstract so that WebAssembly, functions, containers, distributed processes, and virtual machines can be introduced without coupling them to resource discovery.
 
-## 6. Control and data planes
+## 7. Control and data planes
 
 ```
 OpenHost
 ├── Control Plane
 │   ├── Discovery
-│   ├── Scheduler
-│   └── Identity
+│   ├── Identity
+│   ├── Resource Fabric
+│   └── Scheduler
 │
 └── Data Plane
+    ├── Transport
     ├── Execution
     └── Storage
 ```
 
-## 7. Important constraint
+## 8. Important constraint
 
 OpenHost does not attempt to create a conventional shared-memory computer from remote machines.
 
 Network latency makes that abstraction impractical for general workloads.
 
-Instead, OpenHost provides **distributed execution over dynamically assembled logical resources**.
+Instead, OpenHost provides **distributed execution over dynamically assembled logical resources**. Workloads must be scheduled according to the communication patterns and capabilities they actually require.
