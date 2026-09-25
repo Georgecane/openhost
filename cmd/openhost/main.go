@@ -1,8 +1,38 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/Georgecane/openhost/internal/fabric"
+	"github.com/Georgecane/openhost/internal/resource"
+	"github.com/Georgecane/openhost/internal/scheduler"
+)
 
 func main() {
+	fabric := fabric.NewMemoryFabric()
+
+	_ = fabric.Upsert(fabric.ResourceOffer{
+		ParticipantID: "local-demo",
+		Resources: resource.ResourceFragment{
+			CPU:    resource.CPUCapacity{Cores: 1},
+			Memory: resource.MemoryCapacity{Bytes: 256 << 20},
+		},
+	})
+
+	s, err := scheduler.NewAggregatingScheduler(fabric)
+	if err != nil {
+		panic(err)
+	}
+
+	node, err := s.Plan(resource.ResourceFragment{
+		CPU:    resource.CPUCapacity{Cores: 0.5},
+		Memory: resource.MemoryCapacity{Bytes: 128 << 20},
+	})
+	if err != nil {
+		panic(err)
+	}
+
 	fmt.Println("OpenHost")
 	fmt.Println("The infrastructure is the network, not the machine.")
+	fmt.Printf("logical node: %s (%d participant allocation)\n", node.ID, len(node.Allocations))
 }
