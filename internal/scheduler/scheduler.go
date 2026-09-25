@@ -106,6 +106,15 @@ func remainingResources(requirement, allocated resource.ResourceFragment) resour
 }
 
 func minFragment(available, required resource.ResourceFragment) resource.ResourceFragment {
+	if required.Lifetime > 0 && available.Lifetime > 0 && available.Lifetime < required.Lifetime {
+		return resource.ResourceFragment{}
+	}
+
+	lifetime := required.Lifetime
+	if available.Lifetime > 0 && (lifetime == 0 || available.Lifetime < lifetime) {
+		lifetime = available.Lifetime
+	}
+
 	return resource.ResourceFragment{
 		CPU: resource.CPUCapacity{Cores: minFloat(available.CPU.Cores, required.CPU.Cores)},
 		Memory: resource.MemoryCapacity{
@@ -120,7 +129,7 @@ func minFragment(available, required resource.ResourceFragment) resource.Resourc
 		GPU: resource.GPUCapacity{
 			Units: minUint32(available.GPU.Units, required.GPU.Units),
 		},
-		Lifetime: required.Lifetime,
+		Lifetime: lifetime,
 	}
 }
 
