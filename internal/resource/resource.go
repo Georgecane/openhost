@@ -59,11 +59,12 @@ func (r ResourceFragment) Empty() bool {
 		r.GPU.Units == 0
 }
 
+// Add combines two resource fragments. A zero lifetime means no explicit
+// lifetime bound. For bounded fragments, the resulting lifetime is the
+// shortest lifetime because an allocation cannot outlive its shortest-lived
+// backing resource.
 func (r ResourceFragment) Add(other ResourceFragment) ResourceFragment {
-	lifetime := r.Lifetime
-	if other.Lifetime > lifetime {
-		lifetime = other.Lifetime
-	}
+	lifetime := combineLifetime(r.Lifetime, other.Lifetime)
 
 	return ResourceFragment{
 		CPU: CPUCapacity{
@@ -83,6 +84,19 @@ func (r ResourceFragment) Add(other ResourceFragment) ResourceFragment {
 		},
 		Lifetime: lifetime,
 	}
+}
+
+func combineLifetime(a, b time.Duration) time.Duration {
+	if a == 0 {
+		return b
+	}
+	if b == 0 {
+		return a
+	}
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Satisfies reports whether r can provide every requested resource.
