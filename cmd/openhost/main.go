@@ -9,9 +9,9 @@ import (
 )
 
 func main() {
-	fabric := fabric.NewMemoryFabric()
+	resourceFabric := fabric.NewMemoryFabric()
 
-	_ = fabric.Upsert(fabric.ResourceOffer{
+	_ = resourceFabric.Upsert(fabric.ResourceOffer{
 		ParticipantID: "local-demo",
 		Resources: resource.ResourceFragment{
 			CPU:    resource.CPUCapacity{Cores: 1},
@@ -19,7 +19,7 @@ func main() {
 		},
 	})
 
-	s, err := scheduler.NewAggregatingScheduler(fabric)
+	s, err := scheduler.NewAggregatingScheduler(resourceFabric)
 	if err != nil {
 		panic(err)
 	}
