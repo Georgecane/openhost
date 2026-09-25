@@ -1,8 +1,17 @@
 package resource
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
-// ResourceFragment describes a bounded, voluntary contribution of resources.
+var (
+	ErrNegativeCapacity = errors.New("resource capacity cannot be negative")
+	ErrZeroRequirement  = errors.New("resource requirement must not be empty")
+)
+
+// ResourceFragment describes a bounded contribution of resources.
 type ResourceFragment struct {
 	CPU      CPUCapacity
 	Memory   MemoryCapacity
@@ -30,4 +39,68 @@ type NetworkCapacity struct {
 
 type GPUCapacity struct {
 	Units uint32
+}
+
+func (r ResourceFragment) Validate() error {
+	if r.CPU.Cores < 0 {
+		return fmt.Errorf("%w: cpu", ErrNegativeCapacity)
+	}
+	if r.Lifetime < 0 {
+		return fmt.Errorf("%w: lifetime", ErrNegativeCapacity)
+	}
+	return nil
+}
+
+func (r ResourceFragment) Empty() bool {
+	return r.CPU.Cores == 0 &&
+		r.Memory.Bytes == 0 &&
+		r.Storage.Bytes == 0 &&
+		r.Network.BitsPerSecond == 0 &&
+		r.GPU.Units == 0
+}
+
+func (r ResourceFragment) Add(other ResourceFragment) ResourceFragment {
+	lifetime := r.Lifetime
+	if other.Lifetime > lifetime {
+		lifetime = other.Lifetime
+	}
+
+	return ResourceFragment{
+		CPU: CPUCapacity{
+			Cores: r.CPU.Cores + other.CPU.Cores,
+		},
+		Memory: MemoryCapacity{
+			Bytes: r.Memory.Bytes + other.Memory.Bytes,
+		},
+		Storage: StorageCapacity{
+			Bytes: r.Storage.Bytes + other.Storage.Bytes,
+		},
+		Network: NetworkCapacity{
+			BitsPerSecond: r.Network.BitsPerSecond + other.Network.BitsPerSecond,
+		},
+		GPU: GPUCapacity{
+			Units: r.GPU.Units + other.GPU.Units,
+		},
+		Lifetime: lifetime,
+	}
+}
+
+// Satisfies reports whether r can provide every requested resource.
+func (r ResourceFragment) Satisfies(request ResourceFragment) bool {
+	return r.CPU.Cores >= request.CPU.Cores &&
+		r.Memory.Bytes >= request.Memory.Bytes &&
+		r.Storage.Bytes >= request.Storage.Bytes &&
+		r.Network.BitsPerSecond >= request.Network.BitsPerSecond &&
+		r.GPU.Units >= request.GPU.Units &&
+		(r.Lifetime == 0 || request.Lifetime == 0 || r.Lifetime >= request.Lifetime)
+}
+
+func ValidateRequirement(r ResourceFragment) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if r.Empty() {
+		return ErrZeroRequirement
+	}
+	return nil
 }
