@@ -13,6 +13,8 @@ Physical Devices
       ↓
 Resource Fragments
       ↓
+Participation Layer
+      ↓
 Resource Fabric
       ↓
 Resource Aggregation
@@ -26,19 +28,18 @@ Applications / Services
 
 A logical node is an allocation of distributed resources, not a physical server.
 
-## Design goals
+## Design principles
 
-- Distributed resource aggregation
-- Logical infrastructure independent of physical machines
-- Dynamic resource allocation and reallocation
-- Support for persistent and ephemeral participants
-- Strong workload isolation
-- Fault tolerance and node churn handling
-- Pluggable execution runtimes
-- Cross-platform architecture
-- Open protocols and implementation
+- Resource ownership remains with participants.
+- Participation is explicit and voluntary.
+- A participant may contribute only a fraction of its resources.
+- Logical node identity is independent of physical participants.
+- Network latency is treated as a first-class scheduling constraint.
+- Participant churn is expected.
+- Interfaces separate the resource fabric from execution runtimes.
+- The architecture is cross-platform.
 
-## Initial runtime targets
+## Runtime targets
 
 OpenHost is designed to support multiple execution models:
 
@@ -48,11 +49,18 @@ OpenHost is designed to support multiple execution models:
 - Distributed processes
 - Virtual machines
 
-## Status
+## Current status
 
-OpenHost is in the architectural and foundational development stage.
+OpenHost is in the foundational development stage.
 
-The project is experimental. APIs and protocols are expected to evolve substantially.
+The current implementation establishes the resource model, in-memory resource fabric, multi-participant aggregation scheduler, and logical-node allocation model.
+
+## Development
+
+```bash
+go test ./...
+go run ./cmd/openhost
+```
 
 ## Contributing
 
@@ -62,4 +70,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0
+OpenHost is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
