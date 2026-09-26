@@ -1,13 +1,8 @@
 use crate::identity::{Identity, Kind};
+use crate::runtime::Workload as WorkItem;
 use crate::node::LogicalNode;
 use crate::resource::ResourceFragment;
 use std::fmt;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkItem {
-    pub id: String,
-    pub payload: Vec<u8>,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionUnit {
