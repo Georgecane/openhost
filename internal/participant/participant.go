@@ -75,10 +75,19 @@ func (p *Participant) Leave(now time.Time) error {
 	return p.transition(StateLeft, now)
 }
 
-func (p *Participant) Snapshot() Participant {
+type Snapshot struct {
+	ID         identity.Identity
+	Capability capability.Capability
+	Resources  resource.ResourceFragment
+	State      State
+	JoinedAt   time.Time
+	UpdatedAt  time.Time
+}
+
+func (p *Participant) Snapshot() Snapshot {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return Participant{
+	return Snapshot{
 		ID:         p.ID,
 		Capability: p.Capability,
 		Resources:  p.Resources,
