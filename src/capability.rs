@@ -29,7 +29,7 @@ pub struct LifetimeProfile { pub duration: Option<Duration> }
 pub struct SecurityProfile { pub trusted: bool }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapabilityError { Invalid, Negative, InvalidLatency }
+pub enum CapabilityError { Invalid, Negative }
 
 impl std::fmt::Display for CapabilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{self:?}") }
@@ -38,27 +38,26 @@ impl std::error::Error for CapabilityError {}
 
 impl Capability {
     pub fn validate(&self) -> Result<(), CapabilityError> {
-        if self.compute.cpu_cores < 0.0 || self.compute.cpu_cores.is_nan()
-            || !(0.0..=1.0).contains(&self.reliability.availability)
-            || self.lifetime.duration.is_some_and(|d| d.is_zero()) && self.compute.cpu_cores < 0.0
-        {
+        if self.compute.cpu_cores < 0.0 || self.compute.cpu_cores.is_nan() {
             return Err(CapabilityError::Negative);
+        }
+        if !(0.0..=1.0).contains(&self.reliability.availability) {
+            return Err(CapabilityError::Invalid);
+        }
+        if self.lifetime.duration.is_some_and(|d| d.is_zero()) {
+            return Err(CapabilityError::Invalid);
         }
         if self.memory.bytes == 0 && self.storage.bytes == 0 && self.network.bits_per_second == 0
             && self.compute.cpu_cores == 0.0 && self.compute.gpu_units == 0
         {
             return Err(CapabilityError::Invalid);
         }
-        if self.latency.to_participant.is_zero() {
-            return Ok(());
-        }
         Ok(())
     }
 
     pub fn available_for(&self, duration: Option<Duration>) -> bool {
         match (self.lifetime.duration, duration) {
-            (_, None) => true,
-            (None, Some(_)) => true,
+            (_, None) | (None, Some(_)) => true,
             (Some(actual), Some(required)) => actual >= required,
         }
     }
@@ -97,7 +96,7 @@ mod tests {
         assert_eq!(c.validate().unwrap_err(), CapabilityError::Negative);
         c = valid();
         c.reliability.availability = 1.1;
-        assert_eq!(c.validate().unwrap_err(), CapabilityError::Negative);
+        assert_eq!(c.validate().unwrap_err(), CapabilityError::Invalid);
         c = valid();
         c.compute.cpu_cores = 0.0;
         c.memory.bytes = 0;
