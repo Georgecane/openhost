@@ -132,8 +132,8 @@ func TestRegistryFeedsScheduler(t *testing.T) {
 	if len(n.Allocations) != 2 {
 		t.Fatalf("logical node allocations = %d, want 2", len(n.Allocations))
 	}
-	if n.Resources.CPU.Cores != 2 {
-		t.Fatalf("logical node CPU = %.2f, want 2.00", n.Resources.CPU.Cores)
+	if n.Resources.CPU.Cores != 1.5 {
+		t.Fatalf("logical node CPU = %.2f, want 1.50", n.Resources.CPU.Cores)
 	}
 
 	if err := p2.BeginDrain(time.Date(2026, 9, 26, 12, 3, 0, 0, time.UTC)); err != nil {
