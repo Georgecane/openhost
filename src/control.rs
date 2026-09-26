@@ -1,4 +1,5 @@
 use crate::discovery::{Advertisement, Member, Registry as DiscoveryRegistry};
+use crate::execution::{ExecutionError, ExecutionPlan, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::lease::Lease;
 use crate::node::LogicalNode;
@@ -16,6 +17,7 @@ pub enum ControlError {
     InvalidLeaseDuration,
     LeaseNotFound,
     Scheduler(SchedulerError),
+    Execution(ExecutionError),
 }
 
 impl std::fmt::Display for ControlError {
@@ -86,6 +88,14 @@ impl Plane {
         requirement: ResourceFragment,
     ) -> Result<LogicalNode, SchedulerError> {
         self.scheduler.plan(requirement)
+    }
+
+    pub fn create_execution_plan(
+        &self,
+        node: &LogicalNode,
+        workload: &WorkItem,
+    ) -> Result<ExecutionPlan, ControlError> {
+        ExecutionPlan::from_node(node, workload).map_err(ControlError::Execution)
     }
 
     pub fn create_leased_logical_node(
