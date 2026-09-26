@@ -49,8 +49,8 @@ const (
 )
 
 type FreshnessPolicy struct {
-	StaleAfter   time.Duration
-	ExpireAfter  time.Duration
+	StaleAfter  time.Duration
+	ExpireAfter time.Duration
 }
 
 func (p FreshnessPolicy) Validate() error {
