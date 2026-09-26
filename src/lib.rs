@@ -1,6 +1,7 @@
 pub mod capability;
 pub mod control;
 pub mod discovery;
+pub mod endpoint;
 pub mod execution;
 pub mod fabric;
 pub mod identity;
@@ -11,5 +12,4 @@ pub mod registry;
 pub mod resource;
 pub mod runtime;
 pub mod scheduler;
-
 pub mod transport;
