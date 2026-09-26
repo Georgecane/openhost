@@ -3,16 +3,17 @@ name: OpenHost CI
 on:
   push:
     branches: [main]
+  pull_request:
 
 env:
   RUST_VERSION: 1.98.1
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   format:
-    name: Format and commit
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -23,18 +24,7 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
       - name: Format
-        run: cargo fmt --all
-      - name: Commit formatting
-        run: |
-          if git diff --quiet; then
-            echo "Formatting is already clean."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src
-          git commit -m "fmt: format Rust sources"
-          git push origin HEAD:main
+        run: cargo fmt --all -- --check
 
   check:
     name: Check (${{ matrix.os }})
@@ -48,10 +38,8 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout latest main
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -86,10 +74,8 @@ jobs:
             binary: openhost.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout latest main
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
