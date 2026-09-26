@@ -21,6 +21,8 @@ type Registry struct {
 	participants map[string]*participant.Participant
 }
 
+var _ fabric.Fabric = (*Registry)(nil)
+
 func New() *Registry {
 	return &Registry{
 		participants: make(map[string]*participant.Participant),
