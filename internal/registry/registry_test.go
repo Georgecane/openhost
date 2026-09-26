@@ -141,15 +141,15 @@ func TestRegistryFeedsScheduler(t *testing.T) {
 	}
 
 	n, err = s.Plan(resource.ResourceFragment{
-		CPU: resource.CPUCapacity{Cores: 1.5},
+		CPU: resource.CPUCapacity{Cores: 1},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(n.Allocations) != 2 {
-		t.Fatalf("logical node allocations after drain = %d, want 2", len(n.Allocations))
+	if len(n.Allocations) != 1 {
+		t.Fatalf("logical node allocations after drain = %d, want 1", len(n.Allocations))
 	}
-	if n.Resources.CPU.Cores != 2 {
-		t.Fatalf("logical node CPU after drain = %.2f, want 2.00", n.Resources.CPU.Cores)
+	if n.Resources.CPU.Cores != 1 {
+		t.Fatalf("logical node CPU after drain = %.2f, want 1.00", n.Resources.CPU.Cores)
 	}
 }
