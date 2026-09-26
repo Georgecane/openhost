@@ -1,6 +1,7 @@
 pub mod capability;
 pub mod control;
 pub mod discovery;
+pub mod execution;
 pub mod fabric;
 pub mod identity;
 pub mod lease;
