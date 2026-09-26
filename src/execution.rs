@@ -22,6 +22,13 @@ pub struct ExecutionPlan {
     pub units: Vec<ExecutionUnit>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionReceipt {
+    pub workload_id: String,
+    pub node_id: Identity,
+    pub dispatched_units: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionError {
     EmptyWorkloadId,
@@ -29,6 +36,8 @@ pub enum ExecutionError {
     InvalidParticipantIdentity,
     EmptyPlan,
     InvalidResources,
+    WorkloadMismatch,
+    BackendRejected,
 }
 
 impl fmt::Display for ExecutionError {
@@ -38,6 +47,39 @@ impl fmt::Display for ExecutionError {
 }
 
 impl std::error::Error for ExecutionError {}
+
+pub trait ExecutionBackend: Send + Sync {
+    fn execute(
+        &self,
+        plan: &ExecutionPlan,
+        workload: &WorkItem,
+    ) -> Result<ExecutionReceipt, ExecutionError>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopBackend;
+
+impl ExecutionBackend for NoopBackend {
+    fn execute(
+        &self,
+        plan: &ExecutionPlan,
+        workload: &WorkItem,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        if plan.workload_id != workload.id {
+            return Err(ExecutionError::WorkloadMismatch);
+        }
+
+        if plan.units.is_empty() {
+            return Err(ExecutionError::EmptyPlan);
+        }
+
+        Ok(ExecutionReceipt {
+            workload_id: workload.id.clone(),
+            node_id: plan.node_id,
+            dispatched_units: plan.units.len(),
+        })
+    }
+}
 
 impl ExecutionPlan {
     pub fn from_node(node: &LogicalNode, workload: &WorkItem) -> Result<Self, ExecutionError> {
@@ -81,6 +123,14 @@ impl ExecutionPlan {
             .fold(ResourceFragment::default(), |total, unit| {
                 total + unit.resources
             })
+    }
+
+    pub fn execute<B: ExecutionBackend>(
+        &self,
+        backend: &B,
+        workload: &WorkItem,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        backend.execute(self, workload)
     }
 }
 
@@ -165,6 +215,38 @@ mod tests {
         assert_eq!(
             ExecutionPlan::from_node(&node, &workload).unwrap_err(),
             ExecutionError::InvalidParticipantIdentity
+        );
+    }
+
+    #[test]
+    fn backend_receives_plan_without_changing_distribution() {
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: vec![1, 2, 3],
+        };
+        let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
+        let receipt = plan.execute(&NoopBackend, &workload).unwrap();
+
+        assert_eq!(receipt.workload_id, "work-1");
+        assert_eq!(receipt.node_id, plan.node_id);
+        assert_eq!(receipt.dispatched_units, 2);
+    }
+
+    #[test]
+    fn backend_rejects_mismatched_workload() {
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: Vec::new(),
+        };
+        let other = WorkItem {
+            id: "work-2".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
+
+        assert_eq!(
+            plan.execute(&NoopBackend, &other).unwrap_err(),
+            ExecutionError::WorkloadMismatch
         );
     }
 }
