@@ -105,33 +105,6 @@ impl ResourceFragment {
         Ok(())
     }
 
-    fn legacy_add(self, other: Self) -> Self {
-        Self {
-            cpu: Cpu {
-                cores: self.cpu.cores + other.cpu.cores,
-            },
-            memory: Memory {
-                bytes: self.memory.bytes.saturating_add(other.memory.bytes),
-            },
-            storage: Storage {
-                bytes: self.storage.bytes.saturating_add(other.storage.bytes),
-            },
-            network: Network {
-                bits_per_second: self
-                    .network
-                    .bits_per_second
-                    .saturating_add(other.network.bits_per_second),
-            },
-            gpu: Gpu {
-                units: self.gpu.units.saturating_add(other.gpu.units),
-            },
-            lifetime: match (self.lifetime, other.lifetime) {
-                (None, x) | (x, None) => x,
-                (Some(a), Some(b)) => Some(a.min(b)),
-            },
-        }
-    }
-
     pub fn satisfies(&self, requirement: &Self) -> bool {
         self.cpu.cores >= requirement.cpu.cores
             && self.memory.bytes >= requirement.memory.bytes
