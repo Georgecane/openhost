@@ -34,5 +34,11 @@ func main() {
 
 	fmt.Println("OpenHost")
 	fmt.Println("The infrastructure is the network, not the machine.")
-	fmt.Printf("logical node: %s (%d participant allocation)\n", node.ID, len(node.Allocations))
+	fmt.Printf(
+		"logical node: %s (%d participant allocation, %.2f CPU cores, %d bytes memory)\n",
+		node.ID,
+		len(node.Resources.Allocations),
+		node.Resources.Capacity.CPU.Cores,
+		node.Resources.Capacity.Memory.Bytes,
+	)
 }
