@@ -75,7 +75,7 @@ impl ExecutionBackend for NoopBackend {
 
         Ok(ExecutionReceipt {
             workload_id: workload.id.clone(),
-            node_id: plan.node_id,
+            node_id: plan.node_id.clone(),
             dispatched_units: plan.units.len(),
         })
     }
