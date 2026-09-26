@@ -1,35 +1,32 @@
 # OpenHost Architecture
 
-## 1. Resource Fabric
+## 1. Core model
 
-The Resource Fabric represents available capabilities independently of physical machines.
+OpenHost treats infrastructure as a distributed resource fabric.
 
 ```
-Participant A ──┐
-Participant B ──┼── Resource Fabric ── Scheduler ── Logical Node
-Participant C ──┤
-Participant D ──┘
+Physical Devices
+      ↓
+Resource Fragments
+      ↓
+Participation
+      ↓
+Resource Fabric
+      ↓
+Composition
+      ↓
+Logical Nodes
+      ↓
+Distributed Runtime
+      ↓
+Applications
 ```
 
-A participant can contribute a small resource fragment for a bounded lifetime.
+The physical machine is a contributor, not the fundamental abstraction.
 
-## 2. Resource Fragment
+## 2. Composite resources
 
-A fragment describes a bounded contribution rather than exposing an entire machine.
-
-Example:
-
-- 0.07 CPU cores
-- 128 MiB memory
-- 500 MiB storage
-- 2 Mbps network capacity
-- 15 minute lifetime
-
-Fragments are additive for allocation purposes, but they do not imply shared memory or shared CPU semantics.
-
-## 3. Composite Logical Resource
-
-OpenHost represents the result of multi-participant allocation as a `CompositeResource`.
+A `CompositeResource` is the canonical representation of a logical resource assembled from independent allocations.
 
 ```
 Participant A ──┐
@@ -39,127 +36,148 @@ Participant C ──┘          │
                            └── Allocations
 ```
 
-The composite resource has two inseparable views:
+Capacity is the aggregate resource visible to the logical node. Allocations preserve the physical distribution that backs it.
 
-1. **Capacity** — the aggregate resource presented to the logical node.
-2. **Allocations** — the participant fragments that physically back that capacity.
-
-For example:
-
-```
-CompositeResource
-├── Capacity
-│   ├── CPU: 3.0 cores
-│   └── Memory: 12 GiB
-│
-└── Allocations
-    ├── Participant A: 1.0 CPU / 4 GiB
-    ├── Participant B: 0.5 CPU / 2 GiB
-    └── Participant C: 1.5 CPU / 6 GiB
-```
-
-The aggregate is therefore a **logical resource**, not a claim that three machines have become one physical machine.
-
-## 4. Multi-participant allocation
-
-A logical node may be backed by several participants:
-
-```
-Logical Node X
-└── CompositeResource
-    ├── Participant A: 20%
-    ├── Participant B: 30%
-    └── Participant C: 50%
-```
-
-The scheduler constructs the composite resource directly from the allocations it selected. This makes the allocation map part of the logical resource representation instead of keeping aggregate capacity and physical backing as unrelated pieces of state.
-
-If a participant leaves, the scheduler can reconstruct the allocation from the remaining fabric when the workload permits it.
-
-## 5. Scheduler
-
-The scheduler matches workload requirements against the capabilities visible in the fabric.
-
-It asks:
-
-> Which set of capabilities can execute this workload?
-
-rather than:
-
-> Which server should run this workload?
-
-The first scheduler implementation is deliberately simple and deterministic. More advanced policies can later consider topology, latency, reliability, trust, energy, locality, GPU capability, and cost.
-
-The scheduler currently produces a canonical composite resource:
-
-```
-Offers
-  ↓
-Selected allocations
-  ↓
-CompositeResource
-  ├── aggregate capacity
-  └── backing allocations
-```
-
-## 6. Runtime
-
-The runtime executes workloads against logical resources.
-
-The runtime is intentionally abstract so that WebAssembly, functions, containers, distributed processes, and virtual machines can be introduced without coupling them to resource discovery.
-
-A critical distinction is maintained:
+This distinction is fundamental:
 
 ```
 Logical aggregation ≠ physical resource fusion
 ```
 
-OpenHost can expose 3 CPU cores aggregated from multiple participants as one **logical capacity contract**, but an ordinary process cannot automatically execute arbitrary instructions across those machines as if they shared one CPU cache hierarchy and one RAM address space.
+Three remote participants do not become one conventional shared-memory CPU and RAM system. The composite is a capacity contract that a distributed runtime must execute explicitly.
 
-To make the logical resource executable, a runtime must map the composite resource onto a distributed execution model. Examples include task partitioning, actor/process placement, sharding, remote memory services, or other explicitly distributed execution mechanisms.
+## 3. Resource semantics
 
-## 7. Control and data planes
+Resource fragments contain CPU, memory, storage, network, GPU, and lifetime.
 
-```
-OpenHost
-├── Control Plane
-│   ├── Discovery
-│   ├── Identity
-│   ├── Resource Fabric
-│   └── Scheduler
-│
-└── Data Plane
-    ├── Transport
-    ├── Execution
-    └── Storage
-```
+Lifetime uses an explicit Rust `Option<Duration>`:
 
-The control plane decides **what logical resource exists and which participants back it**. The data plane determines **how execution and data movement actually use those allocations**.
+- `Some(duration)` means bounded.
+- `None` means unbounded.
 
-## 8. Important constraint
+When resources are composed, the shortest bounded lifetime wins.
 
-OpenHost does not attempt to create a conventional shared-memory computer from arbitrary remote machines.
+## 4. Participation
 
-Network latency makes that abstraction impractical for general workloads. Existing disaggregated-computing research likewise treats network characteristics as a fundamental constraint, and practical systems often rely on high-performance interconnects or specialized mechanisms when exposing remote memory or other resources.
-
-Therefore:
+Participants have a lifecycle:
 
 ```
+joining → active → draining → left
+joining → left
+active → left
+draining → left
+```
+
+Only active participants publish scheduler-visible offers.
+
+The participant registry is concurrency-safe and owns the membership index, while the participant owns its lifecycle state.
+
+## 5. Discovery
+
+Discovery is separate from local participation.
+
+Advertisements contain:
+
+- participant identity
+- capabilities
+- monotonic sequence
+- sender observation timestamp
+
+The discovery registry tracks local `last_seen` time and classifies members as:
+
+```
+ACTIVE → STALE → EXPIRED
+```
+
+Freshness is evaluated by policy rather than silently changing participant ownership.
+
+## 6. Scheduler
+
+The first scheduler is deterministic and aggregation-based:
+
+```
+Offers
+  ↓
+Requirement matching
+  ↓
+Partial allocations
+  ↓
+CompositeResource
+  ↓
+LogicalNode
+```
+
+It sorts participant IDs to make planning deterministic.
+
+Future scheduling policies can incorporate latency, topology, reliability, trust, energy, locality, GPU topology, cost, and failure domains.
+
+## 7. Leases
+
+A logical-node allocation can produce one lease per physical allocation.
+
+```
+LogicalNode
+   │
+   ├── Lease → Participant A
+   ├── Lease → Participant B
+   └── Lease → Participant C
+```
+
+Lease duration cannot exceed the lifetime of its backing allocation.
+
+## 8. Control plane
+
+The control plane coordinates:
+
+- local participant registration
+- discovery
+- scheduling
+- logical-node creation
+- lease creation
+
+It does not own the domain invariants of those components. Those remain in their respective modules.
+
+## 9. Runtime and future VM
+
+The runtime boundary is deliberately independent of resource discovery.
+
+The intended progression is:
+
+```
+Resource Fabric
+      ↓
 Resource Composition
-        ↓
-Logical Resource Contract
-        ↓
-Distributed Runtime
-        ↓
-Execution
+      ↓
+Logical Machine Contract
+      ↓
+Distributed Execution Model
+      ↓
+Virtual Machine
 ```
 
-rather than:
+The future VM should unify the **computational model**, not fake physical shared memory.
+
+A distributed virtual CPU may map execution units to different participants. Virtual memory may be local, remote, replicated, or sharded. Storage may be distributed. Transport and placement become runtime mechanisms.
+
+The VM therefore consumes a composite resource rather than creating a separate abstraction that hides the fabric.
+
+## 10. Concurrency model
+
+The Rust implementation uses ownership plus explicit synchronization:
+
+- `RwLock` for shared registries and lifecycle state
+- `Arc` for shared ownership
+- immutable snapshots for cross-component observation
+- deterministic ordering where scheduling decisions must be reproducible
+
+The current implementation deliberately avoids unsafe Rust.
+
+## 11. Layer boundary
+
+The project follows:
 
 ```
-Remote Machines
-        ↓
-pretend they are one normal computer
+Design → Implement → Debug → Test → Fix → Verify → Continue
 ```
 
-The composite resource model gives OpenHost a concrete boundary where future distributed runtimes can implement the actual execution semantics without corrupting the resource-management model.
+A higher layer should not become authoritative until the current layer's invariants are tested and verified.
