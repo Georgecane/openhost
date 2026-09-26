@@ -1,7 +1,7 @@
 use crate::execution::WorkItem;
+use crate::identity::{Identity, Kind};
 use crate::resource::ResourceFragment;
 use crate::runtime::{Runtime, RuntimeContext, RuntimeError};
-use crate::identity::{Identity, Kind};
 use crate::transport::{ExecutionRequest, ExecutionResponse, ExecutionStatus};
 
 pub trait ParticipantExecutor: Send + Sync {
@@ -36,12 +36,8 @@ impl<R: Runtime> ParticipantExecutor for RuntimeAdapter<R> {
         resources: ResourceFragment,
         workload: WorkItem,
     ) -> Result<(), EndpointExecutionError> {
-        let context = RuntimeContext::new(
-            participant_id.clone(),
-            node_id.clone(),
-            resources,
-        )
-        .map_err(EndpointExecutionError::Runtime)?;
+        let context = RuntimeContext::new(participant_id.clone(), node_id.clone(), resources)
+            .map_err(EndpointExecutionError::Runtime)?;
 
         workload
             .validate()
@@ -98,12 +94,13 @@ impl<E: ParticipantExecutor> ParticipantExecutionEndpoint<E> {
         let workload = request.workload;
         let node_id = request.node_id;
 
-        self.executor.execute(
-            &self.participant_id,
-            &node_id,
-            request.unit.resources,
-            workload,
-        )
+        self.executor
+            .execute(
+                &self.participant_id,
+                &node_id,
+                request.unit.resources,
+                workload,
+            )
             .map_err(|error| EndpointError::ExecutionFailed {
                 request_id: request_id.clone(),
                 error,
