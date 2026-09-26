@@ -3,14 +3,42 @@ name: OpenHost CI
 on:
   push:
     branches: [main]
-  pull_request:
 
 env:
   RUST_VERSION: 1.98.1
 
+permissions:
+  contents: write
+
 jobs:
+  format:
+    name: Format and commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all
+      - name: Commit formatting
+        run: |
+          if git diff --quiet; then
+            echo "Formatting is already clean."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src
+          git commit -m "fmt: format Rust sources"
+          git push origin HEAD:main
+
   check:
     name: Check (${{ matrix.os }})
+    needs: format
     strategy:
       fail-fast: false
       matrix:
@@ -20,8 +48,10 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout
+      - name: Checkout latest main
         uses: actions/checkout@v4
+        with:
+          ref: main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -40,6 +70,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.os }})
+    needs: check
     strategy:
       fail-fast: false
       matrix:
@@ -54,10 +85,11 @@ jobs:
             artifact: openhost-windows-x86_64
             binary: openhost.exe
     runs-on: ${{ matrix.os }}
-    needs: check
     steps:
-      - name: Checkout
+      - name: Checkout latest main
         uses: actions/checkout@v4
+        with:
+          ref: main
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
