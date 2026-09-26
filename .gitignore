@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/target/
+
+# Rust tooling
+Cargo.lock
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Build and coverage artifacts
+/coverage/
+*.profraw
+*.profdata
