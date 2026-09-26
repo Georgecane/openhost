@@ -91,10 +91,6 @@ impl ExecutionPlan {
             return Err(ExecutionError::EmptyPlan);
         }
 
-        if node.runtime.name.is_empty() || node.runtime.version.is_empty() {
-            return Err(ExecutionError::InvalidRuntimeSpec);
-        }
-
         let mut units = Vec::with_capacity(node.resources.allocations.len());
         for allocation in &node.resources.allocations {
             let participant_id = Identity::parse(&allocation.participant_id, Kind::Participant)
@@ -109,6 +105,10 @@ impl ExecutionPlan {
                 participant_id,
                 resources: allocation.resources,
             });
+        }
+
+        if node.runtime.name.is_empty() || node.runtime.version.is_empty() {
+            return Err(ExecutionError::InvalidRuntimeSpec);
         }
 
         Ok(Self {
