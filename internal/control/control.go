@@ -83,9 +83,9 @@ func (p *Plane) CreateLeasedLogicalNode(
 		return node.LogicalNode{}, nil, err
 	}
 
-	nodeIdentity, err := identity.New(identity.LogicalNodeKind)
+	nodeIdentity, err := identity.Parse(logicalNode.ID, identity.LogicalNodeKind)
 	if err != nil {
-		return node.LogicalNode{}, nil, fmt.Errorf("create logical-node identity: %w", err)
+		return node.LogicalNode{}, nil, fmt.Errorf("parse logical-node identity: %w", err)
 	}
 
 	expiresAt := now.Add(duration)
