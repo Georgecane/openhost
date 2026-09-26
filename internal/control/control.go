@@ -66,11 +66,11 @@ func (p *Plane) RegisterParticipant(part *participant.Participant) error {
 	return p.registry.Register(part)
 }
 
-func (p *Plane) AnnounceParticipant(advertisement discovery.Advertisement) error {
+func (p *Plane) AnnounceParticipant(advertisement discovery.Advertisement, observedAt time.Time) error {
 	if p == nil {
 		return ErrNilPlane
 	}
-	return p.discovery.Upsert(advertisement)
+	return p.discovery.Upsert(advertisement, observedAt)
 }
 
 func (p *Plane) RemoveDiscoveredParticipant(id identity.Identity) error {
@@ -85,6 +85,13 @@ func (p *Plane) DiscoveredParticipants() []discovery.Member {
 		return nil
 	}
 	return p.discovery.Members()
+}
+
+func (p *Plane) DiscoveredParticipantsAt(now time.Time) ([]discovery.Member, error) {
+	if p == nil {
+		return nil, ErrNilPlane
+	}
+	return p.discovery.MembersAt(now)
 }
 
 func (p *Plane) CreateLogicalNode(requirement resource.ResourceFragment) (node.LogicalNode, error) {
