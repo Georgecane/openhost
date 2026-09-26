@@ -14,16 +14,16 @@ import (
 var (
 	ErrInvalidParticipant = errors.New("invalid participant")
 	ErrInvalidTransition  = errors.New("invalid participant state transition")
-	ErrNotActive           = errors.New("participant is not active")
+	ErrNotActive          = errors.New("participant is not active")
 )
 
 type State string
 
 const (
-	StateJoining State = "joining"
-	StateActive  State = "active"
+	StateJoining  State = "joining"
+	StateActive   State = "active"
 	StateDraining State = "draining"
-	StateLeft    State = "left"
+	StateLeft     State = "left"
 )
 
 type Participant struct {
