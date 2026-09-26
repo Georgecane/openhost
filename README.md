@@ -6,7 +6,7 @@ OpenHost is an open-source distributed infrastructure for hosting and cloud comp
 
 Instead of treating a server as a single physical machine, OpenHost treats infrastructure as a **resource fabric**. Small, voluntary resource contributions from many devices can be discovered, aggregated, scheduled, and assigned to logical nodes.
 
-## Core idea
+## Architecture
 
 ```
 Physical Devices
@@ -21,23 +21,47 @@ Resource Aggregation
       ↓
 Logical Nodes
       ↓
-Execution Runtime
+Distributed Runtime
       ↓
 Applications / Services
 ```
 
-A logical node is an allocation of distributed resources, not a physical server.
+A logical node is a logical resource contract backed by independent participant allocations. It is not a claim that remote machines share CPU caches or one physical address space.
 
-## Design principles
+## Rust rewrite
 
-- Resource ownership remains with participants.
-- Participation is explicit and voluntary.
-- A participant may contribute only a fraction of its resources.
-- Logical node identity is independent of physical participants.
-- Network latency is treated as a first-class scheduling constraint.
-- Participant churn is expected.
-- Interfaces separate the resource fabric from execution runtimes.
-- The architecture is cross-platform.
+OpenHost is implemented in **Rust 2024**. The rewrite uses Rust's ownership and synchronization primitives as the foundation for a future distributed execution engine and virtual-machine abstraction.
+
+The current code is organized as explicit domain modules:
+
+- resource composition
+- identity
+- capability
+- participant lifecycle
+- resource fabric
+- discovery
+- registry
+- scheduling
+- logical nodes
+- leases
+- control plane
+- runtime
+
+The long-term runtime boundary is:
+
+```
+Resource Fabric
+      ↓
+Resource Composition
+      ↓
+Logical Machine Contract
+      ↓
+Distributed Execution Model
+      ↓
+Virtual Machine
+```
+
+The VM is intended to consume the Resource Fabric rather than pretending that arbitrary remote machines are one conventional shared-memory computer.
 
 ## Runtime targets
 
@@ -49,24 +73,26 @@ OpenHost is designed to support multiple execution models:
 - Distributed processes
 - Virtual machines
 
-## Current status
-
-OpenHost is in the foundational development stage.
-
-The current implementation establishes the resource model, in-memory resource fabric, multi-participant aggregation scheduler, and logical-node allocation model.
-
 ## Development
 
+Requires a current stable Rust toolchain.
+
 ```bash
-go test ./...
-go run ./cmd/openhost
+cargo fmt --all
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo run --bin openhost
 ```
 
-## Contributing
+## Development workflow
 
-Contributions, architecture discussions, experiments, and criticism are welcome.
+Every architectural layer follows:
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+```
+Design → Implement → Debug → Test → Fix → Verify → Continue
+```
+
+Do not advance a layer while its invariants are unverified.
 
 ## License
 
