@@ -129,9 +129,10 @@ func (p *Plane) CreateLeasedLogicalNode(
 	}
 
 	expiresAt := now.Add(duration)
-	leases := make([]lease.Lease, 0, len(logicalNode.Allocations))
+	allocations := logicalNode.Resources.Allocations
+	leases := make([]lease.Lease, 0, len(allocations))
 
-	for _, allocation := range logicalNode.Allocations {
+	for _, allocation := range allocations {
 		participantIdentity, err := identity.Parse(
 			allocation.ParticipantID,
 			identity.ParticipantKind,
