@@ -1,14 +1,19 @@
 use crate::execution::WorkItem;
 use crate::identity::{Identity, Kind};
+use crate::node::RuntimeSpec;
 use crate::resource::ResourceFragment;
-use crate::runtime::{Runtime, RuntimeContext, RuntimeError};
+use crate::runtime::{
+    Runtime, RuntimeContext, RuntimeError, RuntimeRegistry, RuntimeRegistryError,
+};
 use crate::transport::{ExecutionRequest, ExecutionResponse, ExecutionStatus};
+use std::sync::Arc;
 
 pub trait ParticipantExecutor: Send + Sync {
     fn execute(
         &self,
         participant_id: &Identity,
         node_id: &Identity,
+        runtime: &RuntimeSpec,
         resources: ResourceFragment,
         workload: WorkItem,
     ) -> Result<(), EndpointExecutionError>;
@@ -33,6 +38,7 @@ impl<R: Runtime> ParticipantExecutor for RuntimeAdapter<R> {
         &self,
         participant_id: &Identity,
         node_id: &Identity,
+        _runtime: &RuntimeSpec,
         resources: ResourceFragment,
         workload: WorkItem,
     ) -> Result<(), EndpointExecutionError> {
@@ -49,6 +55,47 @@ impl<R: Runtime> ParticipantExecutor for RuntimeAdapter<R> {
     }
 }
 
+pub struct RegistryRuntimeAdapter {
+    registry: Arc<RuntimeRegistry>,
+}
+
+impl RegistryRuntimeAdapter {
+    pub fn new(registry: Arc<RuntimeRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub fn registry(&self) -> &Arc<RuntimeRegistry> {
+        &self.registry
+    }
+}
+
+impl ParticipantExecutor for RegistryRuntimeAdapter {
+    fn execute(
+        &self,
+        participant_id: &Identity,
+        node_id: &Identity,
+        runtime: &RuntimeSpec,
+        resources: ResourceFragment,
+        workload: WorkItem,
+    ) -> Result<(), EndpointExecutionError> {
+        let runtime = self
+            .registry
+            .resolve(runtime)
+            .map_err(EndpointExecutionError::RuntimeRegistry)?;
+
+        let context = RuntimeContext::new(participant_id.clone(), node_id.clone(), resources)
+            .map_err(EndpointExecutionError::Runtime)?;
+
+        workload
+            .validate()
+            .map_err(EndpointExecutionError::Runtime)?;
+
+        runtime
+            .run(&context, workload)
+            .map_err(EndpointExecutionError::Runtime)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopParticipantExecutor;
 
@@ -57,6 +104,7 @@ impl ParticipantExecutor for NoopParticipantExecutor {
         &self,
         _participant_id: &Identity,
         _node_id: &Identity,
+        _runtime: &RuntimeSpec,
         _resources: ResourceFragment,
         _workload: WorkItem,
     ) -> Result<(), EndpointExecutionError> {
@@ -93,11 +141,13 @@ impl<E: ParticipantExecutor> ParticipantExecutionEndpoint<E> {
         let request_id = request.request_id.clone();
         let workload = request.workload;
         let node_id = request.node_id;
+        let runtime = request.runtime;
 
         self.executor
             .execute(
                 &self.participant_id,
                 &node_id,
+                &runtime,
                 request.unit.resources,
                 workload,
             )
@@ -130,6 +180,14 @@ fn validate_request(
         return Err(EndpointError::InvalidNodeIdentity);
     }
 
+    if request.runtime.name.is_empty() {
+        return Err(EndpointError::InvalidRuntimeSpec);
+    }
+
+    if request.runtime.version.is_empty() {
+        return Err(EndpointError::InvalidRuntimeSpec);
+    }
+
     if request.unit.participant_id.kind != Kind::Participant {
         return Err(EndpointError::InvalidParticipantIdentity);
     }
@@ -150,6 +208,7 @@ pub enum EndpointError {
     EmptyWorkloadId,
     InvalidParticipantIdentity,
     InvalidNodeIdentity,
+    InvalidRuntimeSpec,
     ParticipantMismatch,
     ExecutionFailed {
         request_id: String,
@@ -162,6 +221,7 @@ pub enum EndpointExecutionError {
     Rejected,
     ExecutionFailed,
     Runtime(RuntimeError),
+    RuntimeRegistry(RuntimeRegistryError),
 }
 
 #[cfg(test)]
@@ -170,7 +230,6 @@ mod tests {
     use crate::execution::ExecutionUnit;
     use crate::identity::Kind;
     use crate::resource::{Cpu, ResourceFragment};
-    use crate::transport::ExecutionEndpoint;
 
     #[derive(Debug, Default, Clone, Copy)]
     struct FailingExecutor;
@@ -180,10 +239,31 @@ mod tests {
             &self,
             _participant_id: &Identity,
             _node_id: &Identity,
+            _runtime: &RuntimeSpec,
             _resources: ResourceFragment,
             _workload: WorkItem,
         ) -> Result<(), EndpointExecutionError> {
             Err(EndpointExecutionError::Rejected)
+        }
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct RecordingRuntime;
+
+    impl Runtime for RecordingRuntime {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn run(&self, _context: &RuntimeContext, _workload: WorkItem) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    fn runtime_spec() -> RuntimeSpec {
+        RuntimeSpec {
+            name: "recording".into(),
+            version: "1".into(),
         }
     }
 
@@ -195,6 +275,7 @@ mod tests {
                 payload: vec![1, 2, 3],
             },
             node_id: Identity::new(Kind::LogicalNode),
+            runtime: runtime_spec(),
             unit: ExecutionUnit {
                 participant_id: participant_id.clone(),
                 resources: ResourceFragment {
@@ -202,7 +283,11 @@ mod tests {
                     ..Default::default()
                 },
             },
-            endpoint: ExecutionEndpoint::new(participant_id, "loopback://participant-1").unwrap(),
+            endpoint: crate::transport::ExecutionEndpoint::new(
+                participant_id,
+                "loopback://participant-1",
+            )
+            .unwrap(),
         }
     }
 
@@ -258,6 +343,47 @@ mod tests {
             EndpointError::ExecutionFailed {
                 request_id: "request-1".into(),
                 error: EndpointExecutionError::Rejected,
+            }
+        );
+    }
+
+    #[test]
+    fn registry_adapter_resolves_runtime_from_request() {
+        let mut registry = RuntimeRegistry::default();
+        registry
+            .register(runtime_spec(), Arc::new(RecordingRuntime))
+            .unwrap();
+
+        let endpoint = ParticipantExecutionEndpoint::new(
+            Identity::new(Kind::Participant),
+            RegistryRuntimeAdapter::new(Arc::new(registry)),
+        )
+        .unwrap();
+
+        let participant_id = endpoint.participant_id().clone();
+        let response = endpoint.handle(request(participant_id)).unwrap();
+
+        assert_eq!(response.status, ExecutionStatus::Completed);
+    }
+
+    #[test]
+    fn registry_adapter_reports_missing_runtime() {
+        let endpoint = ParticipantExecutionEndpoint::new(
+            Identity::new(Kind::Participant),
+            RegistryRuntimeAdapter::new(Arc::new(RuntimeRegistry::default())),
+        )
+        .unwrap();
+
+        let participant_id = endpoint.participant_id().clone();
+        let error = endpoint.handle(request(participant_id)).unwrap_err();
+
+        assert_eq!(
+            error,
+            EndpointError::ExecutionFailed {
+                request_id: "request-1".into(),
+                error: EndpointExecutionError::RuntimeRegistry(
+                    RuntimeRegistryError::RuntimeNotFound
+                ),
             }
         );
     }
