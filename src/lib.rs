@@ -10,4 +10,5 @@ pub mod participant;
 pub mod registry;
 pub mod resource;
 pub mod runtime;
+pub mod transport;
 pub mod scheduler;
