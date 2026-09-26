@@ -118,6 +118,10 @@ impl RuntimeRegistry {
     pub fn len(&self) -> usize {
         self.runtimes.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.runtimes.is_empty()
+    }
 }
 
 fn validate_spec(spec: &RuntimeSpec) -> Result<(), RuntimeRegistryError> {
