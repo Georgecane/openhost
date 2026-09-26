@@ -1,5 +1,5 @@
 use crate::identity::{Identity, Kind};
-use crate::resource::ResourceFragment;
+use crate::resource::{Cpu, ResourceFragment};
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +26,7 @@ impl std::fmt::Display for LeaseError {
         write!(f, "{self:?}")
     }
 }
+
 impl std::error::Error for LeaseError {}
 
 impl Lease {
@@ -58,7 +59,8 @@ impl Lease {
         {
             return Err(LeaseError::InvalidNode);
         }
-        if self.participant_id.kind != Kind::Participant || self.participant_id.validate().is_err()
+        if self.participant_id.kind != Kind::Participant
+            || self.participant_id.validate().is_err()
         {
             return Err(LeaseError::InvalidParticipant);
         }
@@ -108,7 +110,7 @@ mod tests {
             node,
             participant,
             ResourceFragment {
-                cpu: crate::resource::CpuCapacity { cores: 2.0 },
+                cpu: Cpu { cores: 2.0 },
                 ..Default::default()
             },
             created,
@@ -127,7 +129,7 @@ mod tests {
             node,
             participant,
             ResourceFragment {
-                cpu: crate::resource::CpuCapacity { cores: 1.0 },
+                cpu: Cpu { cores: 1.0 },
                 lifetime: Some(Duration::from_secs(1800)),
                 ..Default::default()
             },
