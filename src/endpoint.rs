@@ -1,4 +1,6 @@
 use crate::execution::WorkItem;
+use crate::resource::ResourceFragment;
+use crate::runtime::{Runtime, RuntimeContext, RuntimeError};
 use crate::identity::{Identity, Kind};
 use crate::transport::{ExecutionRequest, ExecutionResponse, ExecutionStatus};
 
@@ -7,8 +9,48 @@ pub trait ParticipantExecutor: Send + Sync {
         &self,
         participant_id: &Identity,
         node_id: &Identity,
+        resources: ResourceFragment,
         workload: WorkItem,
     ) -> Result<(), EndpointExecutionError>;
+}
+
+pub struct RuntimeAdapter<R> {
+    runtime: R,
+}
+
+impl<R> RuntimeAdapter<R> {
+    pub fn new(runtime: R) -> Self {
+        Self { runtime }
+    }
+
+    pub fn runtime(&self) -> &R {
+        &self.runtime
+    }
+}
+
+impl<R: Runtime> ParticipantExecutor for RuntimeAdapter<R> {
+    fn execute(
+        &self,
+        participant_id: &Identity,
+        node_id: &Identity,
+        resources: ResourceFragment,
+        workload: WorkItem,
+    ) -> Result<(), EndpointExecutionError> {
+        let context = RuntimeContext::new(
+            participant_id.clone(),
+            node_id.clone(),
+            resources,
+        )
+        .map_err(EndpointExecutionError::Runtime)?;
+
+        workload
+            .validate()
+            .map_err(EndpointExecutionError::Runtime)?;
+
+        self.runtime
+            .run(&context, workload)
+            .map_err(EndpointExecutionError::Runtime)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -19,6 +61,7 @@ impl ParticipantExecutor for NoopParticipantExecutor {
         &self,
         _participant_id: &Identity,
         _node_id: &Identity,
+        _resources: ResourceFragment,
         _workload: WorkItem,
     ) -> Result<(), EndpointExecutionError> {
         Ok(())
@@ -55,8 +98,12 @@ impl<E: ParticipantExecutor> ParticipantExecutionEndpoint<E> {
         let workload = request.workload;
         let node_id = request.node_id;
 
-        self.executor
-            .execute(&self.participant_id, &node_id, workload)
+        self.executor.execute(
+            &self.participant_id,
+            &node_id,
+            request.unit.resources,
+            workload,
+        )
             .map_err(|error| EndpointError::ExecutionFailed {
                 request_id: request_id.clone(),
                 error,
@@ -117,6 +164,7 @@ pub enum EndpointError {
 pub enum EndpointExecutionError {
     Rejected,
     ExecutionFailed,
+    Runtime(RuntimeError),
 }
 
 #[cfg(test)]
@@ -135,6 +183,7 @@ mod tests {
             &self,
             _participant_id: &Identity,
             _node_id: &Identity,
+            _resources: ResourceFragment,
             _workload: WorkItem,
         ) -> Result<(), EndpointExecutionError> {
             Err(EndpointExecutionError::Rejected)
