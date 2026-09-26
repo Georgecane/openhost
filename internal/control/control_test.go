@@ -14,6 +14,10 @@ import (
 	"github.com/Georgecane/openhost/internal/scheduler"
 )
 
+func testDiscoveryPolicy() discovery.FreshnessPolicy {
+	return discovery.FreshnessPolicy{StaleAfter: 10 * time.Second, ExpireAfter: 30 * time.Second}
+}
+
 func newTestParticipant(t *testing.T, cores float64) *participant.Participant {
 	t.Helper()
 
@@ -40,7 +44,10 @@ func newTestParticipant(t *testing.T, cores float64) *participant.Participant {
 
 func TestNewPlaneRejectsNilDependencies(t *testing.T) {
 	r := registry.New()
-	d := discovery.NewMemoryRegistry()
+	d, err := discovery.NewMemoryRegistry(testDiscoveryPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, err := scheduler.NewAggregatingScheduler(r)
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +63,10 @@ func TestNewPlaneRejectsNilDependencies(t *testing.T) {
 
 func TestPlaneRegistersParticipantsAndCreatesLogicalNode(t *testing.T) {
 	r := registry.New()
-	d := discovery.NewMemoryRegistry()
+	d, err := discovery.NewMemoryRegistry(testDiscoveryPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, err := scheduler.NewAggregatingScheduler(r)
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +114,10 @@ func TestPlaneRegistersParticipantsAndCreatesLogicalNode(t *testing.T) {
 
 func TestPlaneObservesParticipantLifecycleThroughRegistry(t *testing.T) {
 	r := registry.New()
-	d := discovery.NewMemoryRegistry()
+	d, err := discovery.NewMemoryRegistry(testDiscoveryPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, err := scheduler.NewAggregatingScheduler(r)
 	if err != nil {
 		t.Fatal(err)
@@ -149,7 +162,10 @@ func TestPlaneObservesParticipantLifecycleThroughRegistry(t *testing.T) {
 
 func TestPlaneCreatesAndStoresLeasesForLogicalNodeAllocations(t *testing.T) {
 	r := registry.New()
-	d := discovery.NewMemoryRegistry()
+	d, err := discovery.NewMemoryRegistry(testDiscoveryPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, err := scheduler.NewAggregatingScheduler(r)
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +237,10 @@ func TestPlaneCreatesAndStoresLeasesForLogicalNodeAllocations(t *testing.T) {
 
 func TestPlaneRejectsInvalidLeaseCreationArguments(t *testing.T) {
 	r := registry.New()
-	d := discovery.NewMemoryRegistry()
+	d, err := discovery.NewMemoryRegistry(testDiscoveryPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, err := scheduler.NewAggregatingScheduler(r)
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +272,10 @@ func TestPlaneRejectsInvalidLeaseCreationArguments(t *testing.T) {
 
 func TestPlaneIntegratesDiscoveryWithoutOwningParticipantLifecycle(t *testing.T) {
 	r := registry.New()
-	d := discovery.NewMemoryRegistry()
+	d, err := discovery.NewMemoryRegistry(testDiscoveryPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
 	s, err := scheduler.NewAggregatingScheduler(r)
 	if err != nil {
 		t.Fatal(err)
@@ -279,7 +301,7 @@ func TestPlaneIntegratesDiscoveryWithoutOwningParticipantLifecycle(t *testing.T)
 		ObservedAt: observedAt,
 	}
 
-	if err := p.AnnounceParticipant(advertisement); err != nil {
+	if err := p.AnnounceParticipant(advertisement, observedAt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -303,7 +325,7 @@ func TestPlaneIntegratesDiscoveryWithoutOwningParticipantLifecycle(t *testing.T)
 	updated.Sequence = 2
 	updated.ObservedAt = observedAt.Add(time.Minute)
 	updated.Capability.Compute.CPUCores = 4
-	if err := p.AnnounceParticipant(updated); err != nil {
+	if err := p.AnnounceParticipant(updated, updated.ObservedAt); err != nil {
 		t.Fatal(err)
 	}
 
