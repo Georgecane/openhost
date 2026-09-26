@@ -251,7 +251,6 @@ func TestPlaneRejectsInvalidLeaseCreationArguments(t *testing.T) {
 	}
 }
 
-
 func TestPlaneIntegratesDiscoveryWithoutOwningParticipantLifecycle(t *testing.T) {
 	r := registry.New()
 	d := discovery.NewMemoryRegistry()
