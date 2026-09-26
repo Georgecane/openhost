@@ -9,7 +9,10 @@ pub struct ExecutionEndpoint {
 }
 
 impl ExecutionEndpoint {
-    pub fn new(participant_id: Identity, locator: impl Into<String>) -> Result<Self, TransportError> {
+    pub fn new(
+        participant_id: Identity,
+        locator: impl Into<String>,
+    ) -> Result<Self, TransportError> {
         if participant_id.kind != Kind::Participant {
             return Err(TransportError::InvalidEndpointIdentity);
         }
