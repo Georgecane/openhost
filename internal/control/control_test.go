@@ -142,3 +142,105 @@ func TestPlaneObservesParticipantLifecycleThroughRegistry(t *testing.T) {
 		t.Fatalf("allocation while draining error = %v, want ErrInsufficientResources", err)
 	}
 }
+
+func TestPlaneCreatesAndStoresLeasesForLogicalNodeAllocations(t *testing.T) {
+	r := registry.New()
+	s, err := scheduler.NewAggregatingScheduler(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := NewPlane(r, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p1 := newTestParticipant(t, 1)
+	p2 := newTestParticipant(t, 1)
+
+	if err := p.RegisterParticipant(p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RegisterParticipant(p2); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	if err := p1.Activate(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := p2.Activate(now); err != nil {
+		t.Fatal(err)
+	}
+
+	n, leases, err := p.CreateLeasedLogicalNode(
+		resource.ResourceFragment{
+			CPU: resource.CPUCapacity{Cores: 1.5},
+		},
+		now,
+		10*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(leases) != len(n.Allocations) {
+		t.Fatalf("leases = %d, allocations = %d", len(leases), len(n.Allocations))
+	}
+
+	nodeID, err := identity.Parse(n.ID, identity.LogicalNodeKind)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, l := range leases {
+		if l.LogicalNodeID != nodeID {
+			t.Fatalf("lease logical node ID = %v, want %v", l.LogicalNodeID, nodeID)
+		}
+		if !l.ActiveAt(now) {
+			t.Fatal("lease must be active at creation time")
+		}
+		if got := l.RemainingAt(now); got != 10*time.Minute {
+			t.Fatalf("lease remaining = %v, want 10m", got)
+		}
+
+		stored, err := p.GetLease(l.ID)
+		if err != nil {
+			t.Fatalf("GetLease() error = %v", err)
+		}
+		if stored.ID != l.ID {
+			t.Fatalf("stored lease ID = %v, want %v", stored.ID, l.ID)
+		}
+	}
+}
+
+func TestPlaneRejectsInvalidLeaseCreationArguments(t *testing.T) {
+	r := registry.New()
+	s, err := scheduler.NewAggregatingScheduler(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := NewPlane(r, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+
+	if _, _, err := p.CreateLeasedLogicalNode(
+		resource.ResourceFragment{CPU: resource.CPUCapacity{Cores: 1}},
+		time.Time{},
+		time.Minute,
+	); !errors.Is(err, ErrInvalidTime) {
+		t.Fatalf("zero timestamp error = %v, want ErrInvalidTime", err)
+	}
+
+	if _, _, err := p.CreateLeasedLogicalNode(
+		resource.ResourceFragment{CPU: resource.CPUCapacity{Cores: 1}},
+		now,
+		0,
+	); !errors.Is(err, ErrInvalidLeaseDuration) {
+		t.Fatalf("zero duration error = %v, want ErrInvalidLeaseDuration", err)
+	}
+}
