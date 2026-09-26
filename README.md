@@ -84,16 +84,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo run --bin openhost
 ```
 
-## Development workflow
-
-Every architectural layer follows:
-
-```
-Design → Implement → Debug → Test → Fix → Verify → Continue
-```
-
-Do not advance a layer while its invariants are unverified.
-
 ## License
 
 OpenHost is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
