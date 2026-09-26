@@ -54,11 +54,7 @@ impl RuntimeContext {
 pub trait Runtime: Send + Sync {
     fn name(&self) -> &str;
 
-    fn run(
-        &self,
-        context: &RuntimeContext,
-        workload: Workload,
-    ) -> Result<(), RuntimeError>;
+    fn run(&self, context: &RuntimeContext, workload: Workload) -> Result<(), RuntimeError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,11 +89,7 @@ mod tests {
             "recording"
         }
 
-        fn run(
-            &self,
-            _context: &RuntimeContext,
-            _workload: Workload,
-        ) -> Result<(), RuntimeError> {
+        fn run(&self, _context: &RuntimeContext, _workload: Workload) -> Result<(), RuntimeError> {
             Ok(())
         }
     }
