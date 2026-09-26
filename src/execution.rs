@@ -78,7 +78,9 @@ impl ExecutionPlan {
     pub fn total_resources(&self) -> ResourceFragment {
         self.units
             .iter()
-            .fold(ResourceFragment::default(), |total, unit| total + unit.resources)
+            .fold(ResourceFragment::default(), |total, unit| {
+                total + unit.resources
+            })
     }
 }
 
