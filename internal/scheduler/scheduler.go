@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"sync/atomic"
 
 	"github.com/Georgecane/openhost/internal/fabric"
+	"github.com/Georgecane/openhost/internal/identity"
 	"github.com/Georgecane/openhost/internal/node"
 	"github.com/Georgecane/openhost/internal/resource"
 )
@@ -23,7 +23,6 @@ type Scheduler interface {
 // AggregatingScheduler builds logical nodes from multiple resource offers.
 type AggregatingScheduler struct {
 	fabric fabric.Fabric
-	serial atomic.Uint64
 }
 
 func NewAggregatingScheduler(f fabric.Fabric) (*AggregatingScheduler, error) {
@@ -77,8 +76,13 @@ func (s *AggregatingScheduler) Plan(requirement resource.ResourceFragment) (node
 		)
 	}
 
+	logicalNodeIdentity, err := identity.New(identity.LogicalNodeKind)
+	if err != nil {
+		return node.LogicalNode{}, fmt.Errorf("create logical-node identity: %w", err)
+	}
+
 	return node.LogicalNode{
-		ID:          fmt.Sprintf("logical-%d", s.serial.Add(1)),
+		ID:          logicalNodeIdentity.ID,
 		Resources:   total,
 		Allocations: allocations,
 	}, nil
