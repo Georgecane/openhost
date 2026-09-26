@@ -46,12 +46,12 @@ func TestAggregatingSchedulerBuildsLogicalNodeFromMultipleParticipants(t *testin
 		t.Fatal(err)
 	}
 
-	if len(n.Allocations) != 2 {
-		t.Fatalf("got %d allocations, want 2", len(n.Allocations))
+	if len(n.Resources.Allocations) != 2 {
+		t.Fatalf("got %d allocations, want 2", len(n.Resources.Allocations))
 	}
 
-	if n.Resources.CPU.Cores != 1.0 {
-		t.Fatalf("got %.2f CPU cores, want 1.0", n.Resources.CPU.Cores)
+	if n.Resources.Capacity.CPU.Cores != 1.0 {
+		t.Fatalf("got %.2f CPU cores, want 1.0", n.Resources.Capacity.CPU.Cores)
 	}
 
 	if !n.Resources.Satisfies(resource.ResourceFragment{
@@ -59,6 +59,10 @@ func TestAggregatingSchedulerBuildsLogicalNodeFromMultipleParticipants(t *testin
 		Memory: resource.MemoryCapacity{Bytes: 384},
 	}) {
 		t.Fatal("logical node does not satisfy requirement")
+	}
+
+	if err := n.Resources.Validate(); err != nil {
+		t.Fatalf("composed resource validation failed: %v", err)
 	}
 }
 
