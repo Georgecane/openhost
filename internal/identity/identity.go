@@ -17,6 +17,7 @@ type Kind string
 const (
 	ParticipantKind Kind = "participant"
 	LogicalNodeKind Kind = "logical-node"
+	LeaseKind        Kind = "lease"
 )
 
 type Identity struct {
@@ -75,7 +76,7 @@ func (i Identity) Validate() error {
 }
 
 func validKind(kind Kind) bool {
-	return kind == ParticipantKind || kind == LogicalNodeKind
+	return kind == ParticipantKind || kind == LogicalNodeKind || kind == LeaseKind
 }
 
 func isCanonicalUUID(id string) bool {
