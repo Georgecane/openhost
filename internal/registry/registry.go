@@ -11,13 +11,13 @@ import (
 )
 
 var (
-	ErrParticipantExists = errors.New("participant already registered")
-	ErrParticipantNotFound = errors.New("participant not found")
+	ErrParticipantExists    = errors.New("participant already registered")
+	ErrParticipantNotFound  = errors.New("participant not found")
 	ErrParticipantNotActive = errors.New("participant is not active")
 )
 
 type Registry struct {
-	mu sync.RWMutex
+	mu           sync.RWMutex
 	participants map[string]*participant.Participant
 }
 
@@ -99,7 +99,7 @@ func (r *Registry) Offers() []fabric.ResourceOffer {
 		}
 		offers = append(offers, fabric.ResourceOffer{
 			ParticipantID: id,
-			Resources: resources,
+			Resources:     resources,
 		})
 	}
 	return offers
