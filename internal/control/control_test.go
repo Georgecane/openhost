@@ -104,11 +104,14 @@ func TestPlaneRegistersParticipantsAndCreatesLogicalNode(t *testing.T) {
 	if n.ID == "" {
 		t.Fatal("logical node ID must not be empty")
 	}
-	if len(n.Allocations) != 2 {
-		t.Fatalf("logical node allocations = %d, want 2", len(n.Allocations))
+	if len(n.Resources.Allocations) != 2 {
+		t.Fatalf("logical node allocations = %d, want 2", len(n.Resources.Allocations))
 	}
-	if n.Resources.CPU.Cores != 1.5 {
-		t.Fatalf("logical node CPU = %.2f, want 1.50", n.Resources.CPU.Cores)
+	if n.Resources.Capacity.CPU.Cores != 1.5 {
+		t.Fatalf("logical node CPU = %.2f, want 1.50", n.Resources.Capacity.CPU.Cores)
+	}
+	if err := n.Resources.Validate(); err != nil {
+		t.Fatalf("logical resource validation failed: %v", err)
 	}
 }
 
@@ -205,8 +208,8 @@ func TestPlaneCreatesAndStoresLeasesForLogicalNodeAllocations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(leases) != len(n.Allocations) {
-		t.Fatalf("leases = %d, allocations = %d", len(leases), len(n.Allocations))
+	if len(leases) != len(n.Resources.Allocations) {
+		t.Fatalf("leases = %d, allocations = %d", len(leases), len(n.Resources.Allocations))
 	}
 
 	nodeID, err := identity.Parse(n.ID, identity.LogicalNodeKind)
@@ -313,8 +316,6 @@ func TestPlaneIntegratesDiscoveryWithoutOwningParticipantLifecycle(t *testing.T)
 		t.Fatalf("discovered participant = %v, want %v", members[0].Advertisement.Participant, participantID)
 	}
 
-	// Discovery is intentionally separate from the local participant registry:
-	// an advertisement alone must not make the participant scheduler-visible.
 	if _, err := p.CreateLogicalNode(resource.ResourceFragment{
 		CPU: resource.CPUCapacity{Cores: 1},
 	}); !errors.Is(err, scheduler.ErrInsufficientResources) {
