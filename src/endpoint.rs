@@ -48,10 +48,7 @@ impl<E> ParticipantExecutionEndpoint<E> {
 }
 
 impl<E: ParticipantExecutor> ParticipantExecutionEndpoint<E> {
-    pub fn handle(
-        &self,
-        request: ExecutionRequest,
-    ) -> Result<ExecutionResponse, EndpointError> {
+    pub fn handle(&self, request: ExecutionRequest) -> Result<ExecutionResponse, EndpointError> {
         validate_request(&self.participant_id, &request)?;
 
         let request_id = request.request_id.clone();
