@@ -167,10 +167,10 @@ mod tests {
             NoopParticipantExecutor,
         );
 
-        assert_eq!(
-            result.unwrap_err(),
-            EndpointError::InvalidParticipantIdentity
-        );
+        assert!(matches!(
+            result,
+            Err(EndpointError::InvalidParticipantIdentity)
+        ));
     }
 
     #[test]
