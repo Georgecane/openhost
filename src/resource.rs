@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::ops::Add;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -104,7 +105,7 @@ impl ResourceFragment {
         Ok(())
     }
 
-    pub fn add(self, other: Self) -> Self {
+    fn legacy_add(self, other: Self) -> Self {
         Self {
             cpu: Cpu {
                 cores: self.cpu.cores + other.cpu.cores,
@@ -144,6 +145,34 @@ impl ResourceFragment {
     }
 }
 
+impl Add for ResourceFragment {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self::Output {
+        Self {
+            cpu: Cpu {
+                cores: self.cpu.cores + other.cpu.cores,
+            },
+            memory: Memory {
+                bytes: self.memory.bytes.saturating_add(other.memory.bytes),
+            },
+            storage: Storage {
+                bytes: self.storage.bytes.saturating_add(other.storage.bytes),
+            },
+            network: Network {
+                bits_per_second: self.network.bits_per_second.saturating_add(other.network.bits_per_second),
+            },
+            gpu: Gpu {
+                units: self.gpu.units.saturating_add(other.gpu.units),
+            },
+            lifetime: match (self.lifetime, other.lifetime) {
+                (None, x) | (x, None) => x,
+                (Some(a), Some(b)) => Some(a.min(b)),
+            },
+        }
+    }
+}
+
 impl CompositeResource {
     pub fn compose(allocations: Vec<Allocation>) -> Result<Self, ResourceError> {
         if allocations.is_empty() {
@@ -164,7 +193,7 @@ impl CompositeResource {
                 .resources
                 .validate_requirement()
                 .map_err(|_| ResourceError::InvalidAllocation)?;
-            capacity = capacity.add(allocation.resources);
+            capacity = capacity + allocation.resources;
         }
 
         Ok(Self {
@@ -213,7 +242,7 @@ mod tests {
             lifetime: Some(Duration::from_secs(10)),
             ..cpu(2.0)
         };
-        let total = a.add(b);
+        let total = a + b;
         assert_eq!(total.cpu.cores, 3.0);
         assert_eq!(total.lifetime, Some(Duration::from_secs(10)));
     }
@@ -228,7 +257,7 @@ mod tests {
             lifetime: Some(Duration::from_secs(10)),
             ..cpu(2.0)
         };
-        assert_eq!(a.add(b).lifetime, Some(Duration::from_secs(10)));
+        assert_eq!((a + b).lifetime, Some(Duration::from_secs(10)));
     }
 
     #[test]
