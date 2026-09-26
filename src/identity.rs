@@ -2,7 +2,11 @@ use std::fmt;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Kind { Participant, LogicalNode, Lease }
+pub enum Kind {
+    Participant,
+    LogicalNode,
+    Lease,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Identity {
@@ -11,24 +15,43 @@ pub struct Identity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityError { Empty, InvalidUuid, NonCanonical, WrongVersion }
+pub enum IdentityError {
+    Empty,
+    InvalidUuid,
+    NonCanonical,
+    WrongVersion,
+}
 
 impl fmt::Display for IdentityError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 impl std::error::Error for IdentityError {}
 
 impl Identity {
     pub fn new(kind: Kind) -> Self {
-        Self { id: Uuid::new_v4().to_string(), kind }
+        Self {
+            id: Uuid::new_v4().to_string(),
+            kind,
+        }
     }
 
     pub fn parse(id: &str, kind: Kind) -> Result<Self, IdentityError> {
-        if id.is_empty() { return Err(IdentityError::Empty); }
+        if id.is_empty() {
+            return Err(IdentityError::Empty);
+        }
         let uuid = Uuid::parse_str(id).map_err(|_| IdentityError::InvalidUuid)?;
-        if uuid.to_string() != id { return Err(IdentityError::NonCanonical); }
-        if uuid.get_version_num() != 4 { return Err(IdentityError::WrongVersion); }
-        Ok(Self { id: id.to_owned(), kind })
+        if uuid.to_string() != id {
+            return Err(IdentityError::NonCanonical);
+        }
+        if uuid.get_version_num() != 4 {
+            return Err(IdentityError::WrongVersion);
+        }
+        Ok(Self {
+            id: id.to_owned(),
+            kind,
+        })
     }
 
     pub fn validate(&self) -> Result<(), IdentityError> {
@@ -50,7 +73,10 @@ mod tests {
     #[test]
     fn rejects_non_canonical_uuid() {
         let upper = "550E8400-E29B-41D4-A716-446655440000";
-        assert_eq!(Identity::parse(upper, Kind::Participant).unwrap_err(), IdentityError::NonCanonical);
+        assert_eq!(
+            Identity::parse(upper, Kind::Participant).unwrap_err(),
+            IdentityError::NonCanonical
+        );
     }
 
     #[test]

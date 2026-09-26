@@ -14,27 +14,51 @@ pub struct Capability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ComputeCapability { pub cpu_cores: f64, pub gpu_units: u32 }
+pub struct ComputeCapability {
+    pub cpu_cores: f64,
+    pub gpu_units: u32,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryCapability { pub bytes: u64 }
+pub struct MemoryCapability {
+    pub bytes: u64,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StorageCapability { pub bytes: u64 }
+pub struct StorageCapability {
+    pub bytes: u64,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NetworkCapability { pub bits_per_second: u64 }
+pub struct NetworkCapability {
+    pub bits_per_second: u64,
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Reliability { pub availability: f64 }
+pub struct Reliability {
+    pub availability: f64,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Latency { pub to_participant: Duration }
+pub struct Latency {
+    pub to_participant: Duration,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Lifetime { pub duration: Option<Duration> }
+pub struct Lifetime {
+    pub duration: Option<Duration>,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Security { pub trusted: bool }
+pub struct Security {
+    pub trusted: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CapabilityError { InvalidCpu, InvalidAvailability, Empty, ZeroLifetime }
+pub enum CapabilityError {
+    InvalidCpu,
+    InvalidAvailability,
+    Empty,
+    ZeroLifetime,
+}
 
 impl fmt::Display for CapabilityError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 impl std::error::Error for CapabilityError {}
 

@@ -43,9 +43,7 @@ impl Default for ResourceFragment {
             cpu: Cpu { cores: 0.0 },
             memory: Memory { bytes: 0 },
             storage: Storage { bytes: 0 },
-            network: Network {
-                bits_per_second: 0,
-            },
+            network: Network { bits_per_second: 0 },
             gpu: Gpu { units: 0 },
             lifetime: None,
         }

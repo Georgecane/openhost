@@ -19,33 +19,53 @@ pub struct MemoryFabric {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FabricError { EmptyParticipant, InvalidResource }
+pub enum FabricError {
+    EmptyParticipant,
+    InvalidResource,
+}
 
 impl fmt::Display for FabricError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 impl std::error::Error for FabricError {}
 
 impl MemoryFabric {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn upsert(&self, offer: ResourceOffer) -> Result<(), FabricError> {
         if offer.participant_id.is_empty() {
             return Err(FabricError::EmptyParticipant);
         }
-        offer.resources.validate().map_err(|_| FabricError::InvalidResource)?;
-        self.offers.write().expect("fabric lock poisoned")
+        offer
+            .resources
+            .validate()
+            .map_err(|_| FabricError::InvalidResource)?;
+        self.offers
+            .write()
+            .expect("fabric lock poisoned")
             .insert(offer.participant_id.clone(), offer);
         Ok(())
     }
 
     pub fn remove(&self, participant_id: &str) {
-        self.offers.write().expect("fabric lock poisoned").remove(participant_id);
+        self.offers
+            .write()
+            .expect("fabric lock poisoned")
+            .remove(participant_id);
     }
 }
 
 impl Fabric for MemoryFabric {
     fn offers(&self) -> Vec<ResourceOffer> {
-        self.offers.read().expect("fabric lock poisoned").values().cloned().collect()
+        self.offers
+            .read()
+            .expect("fabric lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 }

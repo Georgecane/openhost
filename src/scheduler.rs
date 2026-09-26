@@ -41,10 +41,7 @@ impl AggregatingScheduler {
                 cores: (required.cpu.cores - allocated.cpu.cores).max(0.0),
             },
             memory: Memory {
-                bytes: required
-                    .memory
-                    .bytes
-                    .saturating_sub(allocated.memory.bytes),
+                bytes: required.memory.bytes.saturating_sub(allocated.memory.bytes),
             },
             storage: Storage {
                 bytes: required
@@ -138,8 +135,8 @@ impl Scheduler for AggregatingScheduler {
             return Err(SchedulerError::InsufficientResources);
         }
 
-        let resources = CompositeResource::compose(allocations)
-            .map_err(|_| SchedulerError::InvalidOffer)?;
+        let resources =
+            CompositeResource::compose(allocations).map_err(|_| SchedulerError::InvalidOffer)?;
         resources
             .validate()
             .map_err(|_| SchedulerError::InvalidOffer)?;

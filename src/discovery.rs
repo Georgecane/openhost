@@ -20,7 +20,11 @@ pub struct Member {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum State { Active, Stale, Expired }
+pub enum State {
+    Active,
+    Stale,
+    Expired,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FreshnessPolicy {
@@ -38,7 +42,9 @@ pub enum DiscoveryError {
 }
 
 impl fmt::Display for DiscoveryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 impl std::error::Error for DiscoveryError {}
 
@@ -65,20 +71,34 @@ impl Advertisement {
 }
 
 impl Member {
-    pub fn state_at(&self, now: SystemTime, policy: FreshnessPolicy) -> Result<State, DiscoveryError> {
+    pub fn state_at(
+        &self,
+        now: SystemTime,
+        policy: FreshnessPolicy,
+    ) -> Result<State, DiscoveryError> {
         policy.validate()?;
         if self.last_seen == SystemTime::UNIX_EPOCH || now < self.last_seen {
             return Err(DiscoveryError::InvalidTimestamp);
         }
-        let age = now.duration_since(self.last_seen).map_err(|_| DiscoveryError::InvalidTimestamp)?;
-        if age >= policy.expire_after { Ok(State::Expired) }
-        else if age >= policy.stale_after { Ok(State::Stale) }
-        else { Ok(State::Active) }
+        let age = now
+            .duration_since(self.last_seen)
+            .map_err(|_| DiscoveryError::InvalidTimestamp)?;
+        if age >= policy.expire_after {
+            Ok(State::Expired)
+        } else if age >= policy.stale_after {
+            Ok(State::Stale)
+        } else {
+            Ok(State::Active)
+        }
     }
 }
 
 pub trait Registry: Send + Sync {
-    fn upsert(&self, advertisement: Advertisement, received_at: SystemTime) -> Result<(), DiscoveryError>;
+    fn upsert(
+        &self,
+        advertisement: Advertisement,
+        received_at: SystemTime,
+    ) -> Result<(), DiscoveryError>;
     fn remove(&self, id: &Identity) -> Result<(), DiscoveryError>;
     fn get(&self, id: &Identity) -> Result<Member, DiscoveryError>;
     fn members(&self) -> Vec<Member>;
@@ -93,12 +113,19 @@ pub struct MemoryRegistry {
 impl MemoryRegistry {
     pub fn new(policy: FreshnessPolicy) -> Result<Self, DiscoveryError> {
         policy.validate()?;
-        Ok(Self { members: RwLock::new(BTreeMap::new()), policy })
+        Ok(Self {
+            members: RwLock::new(BTreeMap::new()),
+            policy,
+        })
     }
 }
 
 impl Registry for MemoryRegistry {
-    fn upsert(&self, advertisement: Advertisement, received_at: SystemTime) -> Result<(), DiscoveryError> {
+    fn upsert(
+        &self,
+        advertisement: Advertisement,
+        received_at: SystemTime,
+    ) -> Result<(), DiscoveryError> {
         advertisement.validate()?;
         if received_at < advertisement.observed_at || received_at == SystemTime::UNIX_EPOCH {
             return Err(DiscoveryError::InvalidTimestamp);
@@ -111,10 +138,13 @@ impl Registry for MemoryRegistry {
             }
         }
 
-        members.insert(advertisement.participant.id.clone(), Member {
-            advertisement,
-            last_seen: received_at,
-        });
+        members.insert(
+            advertisement.participant.id.clone(),
+            Member {
+                advertisement,
+                last_seen: received_at,
+            },
+        );
         Ok(())
     }
 
@@ -122,21 +152,35 @@ impl Registry for MemoryRegistry {
         if id.kind != Kind::Participant || id.validate().is_err() {
             return Err(DiscoveryError::InvalidAdvertisement);
         }
-        self.members.write().expect("discovery lock poisoned")
-            .remove(&id.id).map(|_| ()).ok_or(DiscoveryError::NotFound)
+        self.members
+            .write()
+            .expect("discovery lock poisoned")
+            .remove(&id.id)
+            .map(|_| ())
+            .ok_or(DiscoveryError::NotFound)
     }
 
     fn get(&self, id: &Identity) -> Result<Member, DiscoveryError> {
-        self.members.read().expect("discovery lock poisoned")
-            .get(&id.id).cloned().ok_or(DiscoveryError::NotFound)
+        self.members
+            .read()
+            .expect("discovery lock poisoned")
+            .get(&id.id)
+            .cloned()
+            .ok_or(DiscoveryError::NotFound)
     }
 
     fn members(&self) -> Vec<Member> {
-        self.members.read().expect("discovery lock poisoned").values().cloned().collect()
+        self.members
+            .read()
+            .expect("discovery lock poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     fn members_at(&self, now: SystemTime) -> Result<Vec<(Member, State)>, DiscoveryError> {
-        self.members().into_iter()
+        self.members()
+            .into_iter()
             .map(|member| {
                 let state = member.state_at(now, self.policy)?;
                 Ok((member, state))
