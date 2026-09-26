@@ -9,6 +9,7 @@ import (
 	"github.com/Georgecane/openhost/internal/identity"
 	"github.com/Georgecane/openhost/internal/participant"
 	"github.com/Georgecane/openhost/internal/resource"
+	"github.com/Georgecane/openhost/internal/scheduler"
 )
 
 func newTestParticipant(t *testing.T) *participant.Participant {
@@ -93,5 +94,62 @@ func TestRegistryGetAndRemove(t *testing.T) {
 	}
 	if _, err := r.Get(id); !errors.Is(err, ErrParticipantNotFound) {
 		t.Fatalf("Get() after Remove() error = %v, want ErrParticipantNotFound", err)
+	}
+}
+
+func TestRegistryFeedsScheduler(t *testing.T) {
+	r := New()
+
+	p1 := newTestParticipant(t)
+	p2 := newTestParticipant(t)
+
+	if err := p1.Activate(time.Date(2026, 9, 26, 12, 1, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p2.Activate(time.Date(2026, 9, 26, 12, 2, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Register(p1); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(p2); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := scheduler.NewAggregatingScheduler(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.Plan(resource.ResourceFragment{
+		CPU: resource.CPUCapacity{Cores: 1.5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(n.Allocations) != 2 {
+		t.Fatalf("logical node allocations = %d, want 2", len(n.Allocations))
+	}
+	if n.Resources.CPU.Cores != 2 {
+		t.Fatalf("logical node CPU = %.2f, want 2.00", n.Resources.CPU.Cores)
+	}
+
+	if err := p2.BeginDrain(time.Date(2026, 9, 26, 12, 3, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err = s.Plan(resource.ResourceFragment{
+		CPU: resource.CPUCapacity{Cores: 1.5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(n.Allocations) != 2 {
+		t.Fatalf("logical node allocations after drain = %d, want 2", len(n.Allocations))
+	}
+	if n.Resources.CPU.Cores != 2 {
+		t.Fatalf("logical node CPU after drain = %.2f, want 2.00", n.Resources.CPU.Cores)
 	}
 }
