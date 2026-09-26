@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Georgecane/openhost/internal/discovery"
 	"github.com/Georgecane/openhost/internal/identity"
 	"github.com/Georgecane/openhost/internal/lease"
 	"github.com/Georgecane/openhost/internal/node"
@@ -18,30 +19,41 @@ import (
 var (
 	ErrNilPlane             = errors.New("control plane must not be nil")
 	ErrNilRegistry          = errors.New("registry must not be nil")
+	ErrNilDiscovery         = errors.New("discovery registry must not be nil")
 	ErrNilScheduler         = errors.New("scheduler must not be nil")
 	ErrInvalidTime          = errors.New("control-plane timestamp must not be zero")
 	ErrInvalidLeaseDuration = errors.New("lease duration must be positive")
 	ErrLeaseNotFound        = errors.New("lease not found")
 )
 
-// Plane coordinates participant registration, logical-node allocation, and
-// lease creation. Domain rules remain owned by their respective packages.
+// Plane coordinates participant registration, discovery, logical-node
+// allocation, and lease creation. Domain rules remain owned by their
+// respective packages.
 type Plane struct {
 	mu        sync.RWMutex
 	registry  *registry.Registry
+	discovery discovery.Registry
 	scheduler scheduler.Scheduler
 	leases    map[string]lease.Lease
 }
 
-func NewPlane(r *registry.Registry, s scheduler.Scheduler) (*Plane, error) {
+func NewPlane(
+	r *registry.Registry,
+	d discovery.Registry,
+	s scheduler.Scheduler,
+) (*Plane, error) {
 	if r == nil {
 		return nil, ErrNilRegistry
+	}
+	if d == nil {
+		return nil, ErrNilDiscovery
 	}
 	if s == nil {
 		return nil, ErrNilScheduler
 	}
 	return &Plane{
 		registry:  r,
+		discovery: d,
 		scheduler: s,
 		leases:    make(map[string]lease.Lease),
 	}, nil
@@ -52,6 +64,27 @@ func (p *Plane) RegisterParticipant(part *participant.Participant) error {
 		return ErrNilPlane
 	}
 	return p.registry.Register(part)
+}
+
+func (p *Plane) AnnounceParticipant(advertisement discovery.Advertisement) error {
+	if p == nil {
+		return ErrNilPlane
+	}
+	return p.discovery.Upsert(advertisement)
+}
+
+func (p *Plane) RemoveDiscoveredParticipant(id identity.Identity) error {
+	if p == nil {
+		return ErrNilPlane
+	}
+	return p.discovery.Remove(id)
+}
+
+func (p *Plane) DiscoveredParticipants() []discovery.Member {
+	if p == nil {
+		return nil
+	}
+	return p.discovery.Members()
 }
 
 func (p *Plane) CreateLogicalNode(requirement resource.ResourceFragment) (node.LogicalNode, error) {
