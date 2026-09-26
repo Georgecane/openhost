@@ -273,10 +273,11 @@ mod tests {
     fn registry_rejects_unknown_runtime() {
         let registry = RuntimeRegistry::default();
 
-        assert_eq!(
-            registry.resolve(&spec("missing", "1")).unwrap_err(),
-            RuntimeRegistryError::RuntimeNotFound
-        );
+        let result = registry.resolve(&spec("missing", "1"));
+        assert!(matches!(
+            result,
+            Err(RuntimeRegistryError::RuntimeNotFound)
+        ));
     }
 
     #[test]
