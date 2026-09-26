@@ -66,10 +66,10 @@ impl AggregatingScheduler {
         available: ResourceFragment,
         remaining: ResourceFragment,
     ) -> Option<ResourceFragment> {
-        if let (Some(a), Some(r)) = (available.lifetime, remaining.lifetime) {
-            if a < r {
-                return None;
-            }
+        if let (Some(a), Some(r)) = (available.lifetime, remaining.lifetime)
+            && a < r
+        {
+            return None;
         }
 
         let share = ResourceFragment {
@@ -120,7 +120,7 @@ impl Scheduler for AggregatingScheduler {
                 continue;
             };
 
-            total = total.add(share);
+            total = total + share;
             allocations.push(Allocation {
                 participant_id: offer.participant_id,
                 resources: share,
