@@ -129,11 +129,14 @@ func TestRegistryFeedsScheduler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(n.Allocations) != 2 {
-		t.Fatalf("logical node allocations = %d, want 2", len(n.Allocations))
+	if len(n.Resources.Allocations) != 2 {
+		t.Fatalf("logical node allocations = %d, want 2", len(n.Resources.Allocations))
 	}
-	if n.Resources.CPU.Cores != 1.5 {
-		t.Fatalf("logical node CPU = %.2f, want 1.50", n.Resources.CPU.Cores)
+	if n.Resources.Capacity.CPU.Cores != 1.5 {
+		t.Fatalf("logical node CPU = %.2f, want 1.50", n.Resources.Capacity.CPU.Cores)
+	}
+	if err := n.Resources.Validate(); err != nil {
+		t.Fatalf("logical resource validation failed: %v", err)
 	}
 
 	if err := p2.BeginDrain(time.Date(2026, 9, 26, 12, 3, 0, 0, time.UTC)); err != nil {
@@ -146,10 +149,10 @@ func TestRegistryFeedsScheduler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(n.Allocations) != 1 {
-		t.Fatalf("logical node allocations after drain = %d, want 1", len(n.Allocations))
+	if len(n.Resources.Allocations) != 1 {
+		t.Fatalf("logical node allocations after drain = %d, want 1", len(n.Resources.Allocations))
 	}
-	if n.Resources.CPU.Cores != 1 {
-		t.Fatalf("logical node CPU after drain = %.2f, want 1.00", n.Resources.CPU.Cores)
+	if n.Resources.Capacity.CPU.Cores != 1 {
+		t.Fatalf("logical node CPU after drain = %.2f, want 1.00", n.Resources.Capacity.CPU.Cores)
 	}
 }
