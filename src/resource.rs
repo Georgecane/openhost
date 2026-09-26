@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn_unbounded_plus_bounded_is_bounded() {
+    fn fn_unbounded_plus_bounded_is_bounded() {
         let a = ResourceFragment { lifetime: None, ..cpu(1.0) };
         let b = ResourceFragment { lifetime: Some(Duration::from_secs(10)), ..cpu(2.0) };
         assert_eq!(a.add(b).lifetime, Some(Duration::from_secs(10)));
