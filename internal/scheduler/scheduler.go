@@ -42,8 +42,8 @@ func (s *AggregatingScheduler) Plan(requirement resource.ResourceFragment) (node
 		return offers[i].ParticipantID < offers[j].ParticipantID
 	})
 
+	allocations := make([]resource.Allocation, 0, len(offers))
 	var total resource.ResourceFragment
-	allocations := make([]node.Allocation, 0, len(offers))
 
 	for _, offer := range offers {
 		if offer.ParticipantID == "" || offer.Resources.Empty() {
@@ -56,7 +56,7 @@ func (s *AggregatingScheduler) Plan(requirement resource.ResourceFragment) (node
 			continue
 		}
 
-		allocations = append(allocations, node.Allocation{
+		allocations = append(allocations, resource.Allocation{
 			ParticipantID: offer.ParticipantID,
 			Resources:     share,
 		})
@@ -76,15 +76,25 @@ func (s *AggregatingScheduler) Plan(requirement resource.ResourceFragment) (node
 		)
 	}
 
+	composed, err := resource.Compose(allocations)
+	if err != nil {
+		return node.LogicalNode{}, fmt.Errorf("compose logical resources: %w", err)
+	}
+	if !composed.Satisfies(requirement) {
+		return node.LogicalNode{}, fmt.Errorf(
+			"%w: composed resource does not satisfy requirement",
+			ErrInsufficientResources,
+		)
+	}
+
 	logicalNodeIdentity, err := identity.New(identity.LogicalNodeKind)
 	if err != nil {
 		return node.LogicalNode{}, fmt.Errorf("create logical-node identity: %w", err)
 	}
 
 	return node.LogicalNode{
-		ID:          logicalNodeIdentity.ID,
-		Resources:   total,
-		Allocations: allocations,
+		ID:        logicalNodeIdentity.ID,
+		Resources: composed,
 	}, nil
 }
 
