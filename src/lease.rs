@@ -59,8 +59,7 @@ impl Lease {
         {
             return Err(LeaseError::InvalidNode);
         }
-        if self.participant_id.kind != Kind::Participant
-            || self.participant_id.validate().is_err()
+        if self.participant_id.kind != Kind::Participant || self.participant_id.validate().is_err()
         {
             return Err(LeaseError::InvalidParticipant);
         }
