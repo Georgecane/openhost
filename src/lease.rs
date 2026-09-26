@@ -1,5 +1,5 @@
 use crate::identity::{Identity, Kind};
-use crate::resource::{Cpu, ResourceFragment};
+use crate::resource::ResourceFragment;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +91,7 @@ impl Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::Cpu;
 
     fn ids() -> (Identity, Identity, Identity) {
         (
