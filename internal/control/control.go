@@ -16,12 +16,12 @@ import (
 )
 
 var (
-	ErrNilPlane     = errors.New("control plane must not be nil")
-	ErrNilRegistry  = errors.New("registry must not be nil")
-	ErrNilScheduler = errors.New("scheduler must not be nil")
-	ErrInvalidTime  = errors.New("control-plane timestamp must not be zero")
+	ErrNilPlane             = errors.New("control plane must not be nil")
+	ErrNilRegistry          = errors.New("registry must not be nil")
+	ErrNilScheduler         = errors.New("scheduler must not be nil")
+	ErrInvalidTime          = errors.New("control-plane timestamp must not be zero")
 	ErrInvalidLeaseDuration = errors.New("lease duration must be positive")
-	ErrLeaseNotFound = errors.New("lease not found")
+	ErrLeaseNotFound        = errors.New("lease not found")
 )
 
 // Plane coordinates participant registration, logical-node allocation, and
