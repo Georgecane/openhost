@@ -8,7 +8,7 @@ pub trait ParticipantExecutor: Send + Sync {
         participant_id: &Identity,
         node_id: &Identity,
         workload: WorkItem,
-    ) -> Result<(), EndpointError>;
+    ) -> Result<(), EndpointExecutionError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -20,7 +20,7 @@ impl ParticipantExecutor for NoopParticipantExecutor {
         _participant_id: &Identity,
         _node_id: &Identity,
         _workload: WorkItem,
-    ) -> Result<(), EndpointError> {
+    ) -> Result<(), EndpointExecutionError> {
         Ok(())
     }
 }
@@ -60,11 +60,9 @@ impl<E: ParticipantExecutor> ParticipantExecutionEndpoint<E> {
 
         self.executor
             .execute(&self.participant_id, &node_id, workload)
-            .map_err(|error| {
-                EndpointError::ExecutionFailed {
-                    request_id: request_id.clone(),
-                    error,
-                }
+            .map_err(|error| EndpointError::ExecutionFailed {
+                request_id: request_id.clone(),
+                error,
             })?;
 
         Ok(ExecutionResponse {
@@ -141,8 +139,8 @@ mod tests {
             _participant_id: &Identity,
             _node_id: &Identity,
             _workload: WorkItem,
-        ) -> Result<(), EndpointError> {
-            Err(EndpointError::EmptyWorkloadId)
+        ) -> Result<(), EndpointExecutionError> {
+            Err(EndpointExecutionError::Rejected)
         }
     }
 
