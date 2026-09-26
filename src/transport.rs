@@ -1,5 +1,6 @@
 use crate::execution::{ExecutionUnit, WorkItem};
 use crate::identity::{Identity, Kind};
+use crate::node::RuntimeSpec;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub struct ExecutionRequest {
     pub request_id: String,
     pub workload: WorkItem,
     pub node_id: Identity,
+    pub runtime: RuntimeSpec,
     pub unit: ExecutionUnit,
     pub endpoint: ExecutionEndpoint,
 }
@@ -81,6 +83,7 @@ pub enum TransportError {
     EmptyLocator,
     InvalidNodeIdentity,
     InvalidParticipantIdentity,
+    InvalidRuntimeSpec,
     EndpointUnavailable,
     RequestRejected,
 }
@@ -114,6 +117,14 @@ impl Transport for LoopbackTransport {
             return Err(TransportError::InvalidNodeIdentity);
         }
 
+        if request.runtime.name.is_empty() {
+            return Err(TransportError::InvalidRuntimeSpec);
+        }
+
+        if request.runtime.version.is_empty() {
+            return Err(TransportError::InvalidRuntimeSpec);
+        }
+
         if request.unit.participant_id.kind != Kind::Participant {
             return Err(TransportError::InvalidParticipantIdentity);
         }
@@ -145,6 +156,10 @@ mod tests {
                 payload: vec![1, 2, 3],
             },
             node_id: Identity::new(Kind::LogicalNode),
+            runtime: RuntimeSpec {
+                name: "recording".into(),
+                version: "1".into(),
+            },
             unit: ExecutionUnit {
                 participant_id: participant_id.clone(),
                 resources: ResourceFragment {
@@ -180,6 +195,17 @@ mod tests {
         assert_eq!(
             LoopbackTransport.dispatch(request).unwrap_err(),
             TransportError::InvalidParticipantIdentity
+        );
+    }
+
+    #[test]
+    fn loopback_rejects_invalid_runtime_spec() {
+        let mut request = request();
+        request.runtime.version.clear();
+
+        assert_eq!(
+            LoopbackTransport.dispatch(request).unwrap_err(),
+            TransportError::InvalidRuntimeSpec
         );
     }
 
