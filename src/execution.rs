@@ -1,5 +1,5 @@
 use crate::identity::{Identity, Kind};
-use crate::node::LogicalNode;
+use crate::node::{LogicalNode, RuntimeSpec};
 use crate::resource::ResourceFragment;
 pub use crate::runtime::Workload as WorkItem;
 use std::fmt;
@@ -14,6 +14,7 @@ pub struct ExecutionUnit {
 pub struct ExecutionPlan {
     pub workload_id: String,
     pub node_id: Identity,
+    pub runtime: RuntimeSpec,
     pub units: Vec<ExecutionUnit>,
 }
 
@@ -31,6 +32,7 @@ pub enum ExecutionError {
     InvalidParticipantIdentity,
     EmptyPlan,
     InvalidResources,
+    InvalidRuntimeSpec,
     WorkloadMismatch,
     BackendRejected,
 }
@@ -89,6 +91,10 @@ impl ExecutionPlan {
             return Err(ExecutionError::EmptyPlan);
         }
 
+        if node.runtime.name.is_empty() || node.runtime.version.is_empty() {
+            return Err(ExecutionError::InvalidRuntimeSpec);
+        }
+
         let mut units = Vec::with_capacity(node.resources.allocations.len());
         for allocation in &node.resources.allocations {
             let participant_id = Identity::parse(&allocation.participant_id, Kind::Participant)
@@ -108,6 +114,7 @@ impl ExecutionPlan {
         Ok(Self {
             workload_id: workload.id.clone(),
             node_id,
+            runtime: node.runtime.clone(),
             units,
         })
     }
@@ -159,7 +166,10 @@ mod tests {
         LogicalNode {
             id: Identity::new(Kind::LogicalNode).id,
             resources,
-            runtime: RuntimeSpec::default(),
+            runtime: RuntimeSpec {
+                name: "recording".into(),
+                version: "1".into(),
+            },
         }
     }
 
@@ -172,8 +182,30 @@ mod tests {
         let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
 
         assert_eq!(plan.workload_id, "work-1");
+        assert_eq!(
+            plan.runtime,
+            RuntimeSpec {
+                name: "recording".into(),
+                version: "1".into(),
+            }
+        );
         assert_eq!(plan.units.len(), 2);
         assert_eq!(plan.total_resources().cpu.cores, 3.0);
+    }
+
+    #[test]
+    fn empty_runtime_spec_is_rejected() {
+        let mut node = node();
+        node.runtime = RuntimeSpec::default();
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: Vec::new(),
+        };
+
+        assert_eq!(
+            ExecutionPlan::from_node(&node, &workload).unwrap_err(),
+            ExecutionError::InvalidRuntimeSpec
+        );
     }
 
     #[test]
