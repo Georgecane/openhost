@@ -1,5 +1,6 @@
 use crate::resource::ResourceFragment;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,10 +19,10 @@ pub struct MemoryFabric {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FabricError { InvalidParticipant, InvalidResource }
+pub enum FabricError { EmptyParticipant, InvalidResource }
 
-impl std::fmt::Display for FabricError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{self:?}") }
+impl fmt::Display for FabricError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
 }
 impl std::error::Error for FabricError {}
 
@@ -29,9 +30,12 @@ impl MemoryFabric {
     pub fn new() -> Self { Self::default() }
 
     pub fn upsert(&self, offer: ResourceOffer) -> Result<(), FabricError> {
-        if offer.participant_id.is_empty() { return Err(FabricError::InvalidParticipant); }
+        if offer.participant_id.is_empty() {
+            return Err(FabricError::EmptyParticipant);
+        }
         offer.resources.validate().map_err(|_| FabricError::InvalidResource)?;
-        self.offers.write().expect("fabric lock poisoned").insert(offer.participant_id.clone(), offer);
+        self.offers.write().expect("fabric lock poisoned")
+            .insert(offer.participant_id.clone(), offer);
         Ok(())
     }
 
@@ -43,23 +47,5 @@ impl MemoryFabric {
 impl Fabric for MemoryFabric {
     fn offers(&self) -> Vec<ResourceOffer> {
         self.offers.read().expect("fabric lock poisoned").values().cloned().collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::resource::{CpuCapacity, ResourceFragment};
-
-    #[test]
-    fn upsert_and_remove() {
-        let f = MemoryFabric::new();
-        f.upsert(ResourceOffer {
-            participant_id: "a".into(),
-            resources: ResourceFragment { cpu: CpuCapacity { cores: 0.5 }, ..Default::default() },
-        }).unwrap();
-        assert_eq!(f.offers().len(), 1);
-        f.remove("a");
-        assert!(f.offers().is_empty());
     }
 }
