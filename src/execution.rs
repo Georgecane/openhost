@@ -1,7 +1,7 @@
 use crate::identity::{Identity, Kind};
 use crate::node::LogicalNode;
 use crate::resource::ResourceFragment;
-use crate::runtime::Workload as WorkItem;
+pub use crate::runtime::Workload as WorkItem;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
