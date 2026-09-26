@@ -1,0 +1,18 @@
+[package]
+name = "openhost"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "GPL-3.0-only"
+description = "Distributed resource infrastructure where the network is the machine."
+
+[dependencies]
+uuid = { version = "1.18", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "deny"
