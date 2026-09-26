@@ -1,6 +1,6 @@
 use crate::discovery::{Advertisement, Member, Registry as DiscoveryRegistry};
 use crate::identity::{Identity, Kind};
-use crate::lease::{Lease, LeaseError};
+use crate::lease::Lease;
 use crate::node::LogicalNode;
 use crate::participant::Participant;
 use crate::registry::Registry;
@@ -76,7 +76,9 @@ impl Plane {
         &self,
         now: SystemTime,
     ) -> Result<Vec<Member>, crate::discovery::DiscoveryError> {
-        self.discovery.members_at(now)
+        self.discovery
+            .members_at(now)
+            .map(|members| members.into_iter().map(|(member, _)| member).collect())
     }
 
     pub fn create_logical_node(
