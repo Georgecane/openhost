@@ -3,19 +3,29 @@ use std::fmt;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Cpu { pub cores: f64 }
+pub struct Cpu {
+    pub cores: f64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Memory { pub bytes: u64 }
+pub struct Memory {
+    pub bytes: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Storage { pub bytes: u64 }
+pub struct Storage {
+    pub bytes: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Network { pub bits_per_second: u64 }
+pub struct Network {
+    pub bits_per_second: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Gpu { pub units: u32 }
+pub struct Gpu {
+    pub units: u32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResourceFragment {
@@ -33,7 +43,9 @@ impl Default for ResourceFragment {
             cpu: Cpu { cores: 0.0 },
             memory: Memory { bytes: 0 },
             storage: Storage { bytes: 0 },
-            network: Network { bits_per_second: 0 },
+            network: Network {
+                bits_per_second: 0,
+            },
             gpu: Gpu { units: 0 },
             lifetime: None,
         }
@@ -63,8 +75,11 @@ pub enum ResourceError {
 }
 
 impl fmt::Display for ResourceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
+
 impl std::error::Error for ResourceError {}
 
 impl ResourceFragment {
@@ -85,17 +100,32 @@ impl ResourceFragment {
 
     pub fn validate_requirement(&self) -> Result<(), ResourceError> {
         self.validate()?;
-        if self.is_empty() { return Err(ResourceError::EmptyRequirement); }
+        if self.is_empty() {
+            return Err(ResourceError::EmptyRequirement);
+        }
         Ok(())
     }
 
     pub fn add(self, other: Self) -> Self {
         Self {
-            cpu: Cpu { cores: self.cpu.cores + other.cpu.cores },
-            memory: Memory { bytes: self.memory.bytes.saturating_add(other.memory.bytes) },
-            storage: Storage { bytes: self.storage.bytes.saturating_add(other.storage.bytes) },
-            network: Network { bits_per_second: self.network.bits_per_second.saturating_add(other.network.bits_per_second) },
-            gpu: Gpu { units: self.gpu.units.saturating_add(other.gpu.units) },
+            cpu: Cpu {
+                cores: self.cpu.cores + other.cpu.cores,
+            },
+            memory: Memory {
+                bytes: self.memory.bytes.saturating_add(other.memory.bytes),
+            },
+            storage: Storage {
+                bytes: self.storage.bytes.saturating_add(other.storage.bytes),
+            },
+            network: Network {
+                bits_per_second: self
+                    .network
+                    .bits_per_second
+                    .saturating_add(other.network.bits_per_second),
+            },
+            gpu: Gpu {
+                units: self.gpu.units.saturating_add(other.gpu.units),
+            },
             lifetime: match (self.lifetime, other.lifetime) {
                 (None, x) | (x, None) => x,
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -118,7 +148,9 @@ impl ResourceFragment {
 
 impl CompositeResource {
     pub fn compose(allocations: Vec<Allocation>) -> Result<Self, ResourceError> {
-        if allocations.is_empty() { return Err(ResourceError::EmptyComposite); }
+        if allocations.is_empty() {
+            return Err(ResourceError::EmptyComposite);
+        }
 
         let mut seen = HashSet::with_capacity(allocations.len());
         let mut capacity = ResourceFragment::default();
@@ -130,12 +162,17 @@ impl CompositeResource {
             if !seen.insert(&allocation.participant_id) {
                 return Err(ResourceError::DuplicateParticipant);
             }
-            allocation.resources.validate_requirement()
+            allocation
+                .resources
+                .validate_requirement()
                 .map_err(|_| ResourceError::InvalidAllocation)?;
             capacity = capacity.add(allocation.resources);
         }
 
-        Ok(Self { capacity, allocations })
+        Ok(Self {
+            capacity,
+            allocations,
+        })
     }
 
     pub fn validate(&self) -> Result<(), ResourceError> {
@@ -151,7 +188,9 @@ impl CompositeResource {
     }
 
     pub fn allocation_for(&self, participant_id: &str) -> Option<&Allocation> {
-        self.allocations.iter().find(|a| a.participant_id == participant_id)
+        self.allocations
+            .iter()
+            .find(|a| a.participant_id == participant_id)
     }
 }
 
@@ -160,13 +199,22 @@ mod tests {
     use super::*;
 
     fn cpu(cores: f64) -> ResourceFragment {
-        ResourceFragment { cpu: Cpu { cores }, ..Default::default() }
+        ResourceFragment {
+            cpu: Cpu { cores },
+            ..Default::default()
+        }
     }
 
     #[test]
     fn bounded_composition_uses_shortest_lifetime() {
-        let a = ResourceFragment { lifetime: Some(Duration::from_secs(30)), ..cpu(1.0) };
-        let b = ResourceFragment { lifetime: Some(Duration::from_secs(10)), ..cpu(2.0) };
+        let a = ResourceFragment {
+            lifetime: Some(Duration::from_secs(30)),
+            ..cpu(1.0)
+        };
+        let b = ResourceFragment {
+            lifetime: Some(Duration::from_secs(10)),
+            ..cpu(2.0)
+        };
         let total = a.add(b);
         assert_eq!(total.cpu.cores, 3.0);
         assert_eq!(total.lifetime, Some(Duration::from_secs(10)));
@@ -174,17 +222,30 @@ mod tests {
 
     #[test]
     fn fn_unbounded_plus_bounded_is_bounded() {
-        let a = ResourceFragment { lifetime: None, ..cpu(1.0) };
-        let b = ResourceFragment { lifetime: Some(Duration::from_secs(10)), ..cpu(2.0) };
+        let a = ResourceFragment {
+            lifetime: None,
+            ..cpu(1.0)
+        };
+        let b = ResourceFragment {
+            lifetime: Some(Duration::from_secs(10)),
+            ..cpu(2.0)
+        };
         assert_eq!(a.add(b).lifetime, Some(Duration::from_secs(10)));
     }
 
     #[test]
     fn composition_is_canonical() {
         let composite = CompositeResource::compose(vec![
-            Allocation { participant_id: "a".into(), resources: cpu(0.75) },
-            Allocation { participant_id: "b".into(), resources: cpu(1.25) },
-        ]).unwrap();
+            Allocation {
+                participant_id: "a".into(),
+                resources: cpu(0.75),
+            },
+            Allocation {
+                participant_id: "b".into(),
+                resources: cpu(1.25),
+            },
+        ])
+        .unwrap();
         assert_eq!(composite.capacity.cpu.cores, 2.0);
         composite.validate().unwrap();
     }
@@ -192,18 +253,29 @@ mod tests {
     #[test]
     fn duplicate_participants_are_rejected() {
         let result = CompositeResource::compose(vec![
-            Allocation { participant_id: "a".into(), resources: cpu(1.0) },
-            Allocation { participant_id: "a".into(), resources: cpu(1.0) },
+            Allocation {
+                participant_id: "a".into(),
+                resources: cpu(1.0),
+            },
+            Allocation {
+                participant_id: "a".into(),
+                resources: cpu(1.0),
+            },
         ]);
         assert_eq!(result.unwrap_err(), ResourceError::DuplicateParticipant);
     }
 
     #[test]
     fn tampered_capacity_is_rejected() {
-        let mut composite = CompositeResource::compose(vec![
-            Allocation { participant_id: "a".into(), resources: cpu(1.0) },
-        ]).unwrap();
+        let mut composite = CompositeResource::compose(vec![Allocation {
+            participant_id: "a".into(),
+            resources: cpu(1.0),
+        }])
+        .unwrap();
         composite.capacity.cpu.cores = 2.0;
-        assert_eq!(composite.validate().unwrap_err(), ResourceError::CapacityMismatch);
+        assert_eq!(
+            composite.validate().unwrap_err(),
+            ResourceError::CapacityMismatch
+        );
     }
 }
