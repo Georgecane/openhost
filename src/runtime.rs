@@ -98,10 +98,7 @@ impl RuntimeRegistry {
         Ok(())
     }
 
-    pub fn resolve(
-        &self,
-        spec: &RuntimeSpec,
-    ) -> Result<Arc<dyn Runtime>, RuntimeRegistryError> {
+    pub fn resolve(&self, spec: &RuntimeSpec) -> Result<Arc<dyn Runtime>, RuntimeRegistryError> {
         validate_spec(spec)?;
 
         self.runtimes
@@ -261,9 +258,13 @@ mod tests {
         let mut registry = RuntimeRegistry::default();
         let runtime: Arc<dyn Runtime> = Arc::new(RecordingRuntime);
 
-        registry.register(spec("recording", "1"), runtime.clone()).unwrap();
+        registry
+            .register(spec("recording", "1"), runtime.clone())
+            .unwrap();
         assert_eq!(
-            registry.register(spec("recording", "1"), runtime).unwrap_err(),
+            registry
+                .register(spec("recording", "1"), runtime)
+                .unwrap_err(),
             RuntimeRegistryError::DuplicateRuntime
         );
     }
