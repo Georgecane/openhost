@@ -133,7 +133,10 @@ impl Add for ResourceFragment {
                 bytes: self.storage.bytes.saturating_add(other.storage.bytes),
             },
             network: Network {
-                bits_per_second: self.network.bits_per_second.saturating_add(other.network.bits_per_second),
+                bits_per_second: self
+                    .network
+                    .bits_per_second
+                    .saturating_add(other.network.bits_per_second),
             },
             gpu: Gpu {
                 units: self.gpu.units.saturating_add(other.gpu.units),
