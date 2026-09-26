@@ -132,10 +132,10 @@ impl Registry for MemoryRegistry {
         }
 
         let mut members = self.members.write().expect("discovery lock poisoned");
-        if let Some(existing) = members.get(&advertisement.participant.id) {
-            if advertisement.sequence < existing.advertisement.sequence {
-                return Err(DiscoveryError::StaleSequence);
-            }
+        if let Some(existing) = members.get(&advertisement.participant.id)
+            && advertisement.sequence < existing.advertisement.sequence
+        {
+            return Err(DiscoveryError::StaleSequence);
         }
 
         members.insert(
