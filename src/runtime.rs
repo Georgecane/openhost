@@ -274,10 +274,7 @@ mod tests {
         let registry = RuntimeRegistry::default();
 
         let result = registry.resolve(&spec("missing", "1"));
-        assert!(matches!(
-            result,
-            Err(RuntimeRegistryError::RuntimeNotFound)
-        ));
+        assert!(matches!(result, Err(RuntimeRegistryError::RuntimeNotFound)));
     }
 
     #[test]
