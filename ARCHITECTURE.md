@@ -140,7 +140,7 @@ The control plane decides **what logical resource exists and which participants 
 
 OpenHost does not attempt to create a conventional shared-memory computer from arbitrary remote machines.
 
-Network latency makes that abstraction impractical for general workloads. Existing disaggregated-computing research likewise treats network characteristics as a fundamental constraint, and practical systems often rely on high-performance interconnects or specialized mechanisms when exposing remote memory or other resources. citeturn2search0turn2search13
+Network latency makes that abstraction impractical for general workloads. Existing disaggregated-computing research likewise treats network characteristics as a fundamental constraint, and practical systems often rely on high-performance interconnects or specialized mechanisms when exposing remote memory or other resources.
 
 Therefore:
 
