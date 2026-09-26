@@ -1,15 +1,15 @@
 use crate::fabric::{Fabric, ResourceOffer};
 use crate::identity::{Identity, Kind};
 use crate::node::LogicalNode;
-use crate::resource::{Allocation, CompositeResource, CpuCapacity, GpuCapacity, MemoryCapacity, NetworkCapacity, ResourceFragment, StorageCapacity};
+use crate::resource::{Allocation, CompositeResource, Cpu, Gpu, Memory, Network, ResourceFragment, Storage};
+use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchedulerError { InsufficientResources, NilFabric }
+pub enum SchedulerError { InvalidRequirement, InsufficientResources, InvalidOffer }
 
-impl std::fmt::Display for SchedulerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{self:?}") }
+impl fmt::Display for SchedulerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") }
 }
 impl std::error::Error for SchedulerError {}
 
@@ -24,61 +24,70 @@ pub struct AggregatingScheduler {
 impl AggregatingScheduler {
     pub fn new(fabric: Arc<dyn Fabric>) -> Self { Self { fabric } }
 
-    fn remaining(requirement: ResourceFragment, allocated: ResourceFragment) -> ResourceFragment {
+    fn remaining(required: ResourceFragment, allocated: ResourceFragment) -> ResourceFragment {
         ResourceFragment {
-            cpu: CpuCapacity { cores: (requirement.cpu.cores - allocated.cpu.cores).max(0.0) },
-            memory: MemoryCapacity { bytes: requirement.memory.bytes.saturating_sub(allocated.memory.bytes) },
-            storage: StorageCapacity { bytes: requirement.storage.bytes.saturating_sub(allocated.storage.bytes) },
-            network: NetworkCapacity { bits_per_second: requirement.network.bits_per_second.saturating_sub(allocated.network.bits_per_second) },
-            gpu: GpuCapacity { units: requirement.gpu.units.saturating_sub(allocated.gpu.units) },
-            lifetime: requirement.lifetime,
+            cpu: Cpu { cores: (required.cpu.cores - allocated.cpu.cores).max(0.0) },
+            memory: Memory { bytes: required.memory.bytes.saturating_sub(allocated.memory.bytes) },
+            storage: Storage { bytes: required.storage.bytes.saturating_sub(allocated.storage.bytes) },
+            network: Network { bits_per_second: required.network.bits_per_second.saturating_sub(allocated.network.bits_per_second) },
+            gpu: Gpu { units: required.gpu.units.saturating_sub(allocated.gpu.units) },
+            lifetime: required.lifetime,
         }
     }
 
-    fn min_fragment(available: ResourceFragment, required: ResourceFragment) -> ResourceFragment {
-        if let (Some(a), Some(r)) = (available.lifetime, required.lifetime) {
-            if a < r { return ResourceFragment::default(); }
+    fn allocation_share(available: ResourceFragment, remaining: ResourceFragment) -> Option<ResourceFragment> {
+        if let (Some(a), Some(r)) = (available.lifetime, remaining.lifetime) {
+            if a < r { return None; }
         }
-        let lifetime = match (available.lifetime, required.lifetime) {
-            (Some(a), Some(r)) => Some(a.min(r)),
-            (Some(a), None) => Some(a),
-            (None, Some(r)) => Some(r),
-            (None, None) => None,
+
+        let share = ResourceFragment {
+            cpu: Cpu { cores: available.cpu.cores.min(remaining.cpu.cores) },
+            memory: Memory { bytes: available.memory.bytes.min(remaining.memory.bytes) },
+            storage: Storage { bytes: available.storage.bytes.min(remaining.storage.bytes) },
+            network: Network { bits_per_second: available.network.bits_per_second.min(remaining.network.bits_per_second) },
+            gpu: Gpu { units: available.gpu.units.min(remaining.gpu.units) },
+            lifetime: remaining.lifetime,
         };
-        ResourceFragment {
-            cpu: CpuCapacity { cores: available.cpu.cores.min(required.cpu.cores) },
-            memory: MemoryCapacity { bytes: available.memory.bytes.min(required.memory.bytes) },
-            storage: StorageCapacity { bytes: available.storage.bytes.min(required.storage.bytes) },
-            network: NetworkCapacity { bits_per_second: available.network.bits_per_second.min(required.network.bits_per_second) },
-            gpu: GpuCapacity { units: available.gpu.units.min(required.gpu.units) },
-            lifetime,
-        }
+
+        (!share.is_empty()).then_some(share)
     }
 }
 
 impl Scheduler for AggregatingScheduler {
     fn plan(&self, requirement: ResourceFragment) -> Result<LogicalNode, SchedulerError> {
-        requirement.validate_requirement().map_err(|_| SchedulerError::InsufficientResources)?;
+        requirement.validate_requirement().map_err(|_| SchedulerError::InvalidRequirement)?;
+
         let mut offers: Vec<ResourceOffer> = self.fabric.offers();
         offers.sort_by(|a, b| a.participant_id.cmp(&b.participant_id));
 
-        let mut allocations = Vec::new();
         let mut total = ResourceFragment::default();
+        let mut allocations = Vec::new();
 
         for offer in offers {
-            if offer.participant_id.is_empty() || offer.resources.is_empty() { continue; }
-            let share = Self::min_fragment(offer.resources, Self::remaining(requirement, total));
-            if share.is_empty() { continue; }
-            allocations.push(Allocation { participant_id: offer.participant_id, resources: share });
+            if offer.participant_id.is_empty() || offer.resources.validate().is_err() {
+                return Err(SchedulerError::InvalidOffer);
+            }
+
+            let remaining = Self::remaining(requirement, total);
+            let Some(share) = Self::allocation_share(offer.resources, remaining) else { continue };
+
             total = total.add(share);
+            allocations.push(Allocation { participant_id: offer.participant_id, resources: share });
+
             if total.satisfies(&requirement) { break; }
         }
 
-        if !total.satisfies(&requirement) { return Err(SchedulerError::InsufficientResources); }
-        let composed = CompositeResource::compose(allocations).map_err(|_| SchedulerError::InsufficientResources)?;
-        if !composed.satisfies(&requirement) { return Err(SchedulerError::InsufficientResources); }
+        if !total.satisfies(&requirement) {
+            return Err(SchedulerError::InsufficientResources);
+        }
+
+        let resources = CompositeResource::compose(allocations)
+            .map_err(|_| SchedulerError::InvalidOffer)?;
+        resources.validate().map_err(|_| SchedulerError::InvalidOffer)?;
 
         let id = Identity::new(Kind::LogicalNode);
-        Ok(LogicalNode { id: id.id, resources: composed, runtime: Default::default() })
+        Ok(LogicalNode { id: id.id, resources, runtime: RuntimeSpec::default() })
     }
 }
+
+use crate::node::RuntimeSpec;
