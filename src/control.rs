@@ -98,6 +98,18 @@ impl Plane {
         ExecutionPlan::from_node(node, workload).map_err(ControlError::Execution)
     }
 
+    pub fn dispatch_execution_plan<T: crate::transport::Transport>(
+        &self,
+        plan: &ExecutionPlan,
+        workload: &WorkItem,
+        endpoints: &[crate::transport::ExecutionEndpoint],
+        transport: T,
+    ) -> Result<crate::execution::DispatchReceipt, ControlError> {
+        crate::execution::ExecutionDispatcher::new(transport)
+            .dispatch(plan, workload, endpoints)
+            .map_err(ControlError::Execution)
+    }
+
     pub fn create_leased_logical_node(
         &self,
         requirement: ResourceFragment,
