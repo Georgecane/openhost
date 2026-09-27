@@ -112,6 +112,11 @@ impl ParticipantExecutor for NoopParticipantExecutor {
     }
 }
 
+pub trait ExecutionHandler: Send + Sync {
+    fn participant_id(&self) -> &Identity;
+    fn handle_request(&self, request: ExecutionRequest) -> Result<ExecutionResponse, EndpointError>;
+}
+
 pub struct ParticipantExecutionEndpoint<E> {
     participant_id: Identity,
     executor: E,
@@ -161,6 +166,16 @@ impl<E: ParticipantExecutor> ParticipantExecutionEndpoint<E> {
             status: ExecutionStatus::Completed,
             error: None,
         })
+    }
+}
+
+impl<E: ParticipantExecutor + Send + Sync> ExecutionHandler for ParticipantExecutionEndpoint<E> {
+    fn participant_id(&self) -> &Identity {
+        &self.participant_id
+    }
+
+    fn handle_request(&self, request: ExecutionRequest) -> Result<ExecutionResponse, EndpointError> {
+        self.handle(request)
     }
 }
 
