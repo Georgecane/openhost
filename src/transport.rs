@@ -88,10 +88,7 @@ impl EndpointTransport {
         Self::default()
     }
 
-    pub fn register(
-        &self,
-        endpoint: Arc<dyn ExecutionHandler>,
-    ) -> Result<(), TransportError> {
+    pub fn register(&self, endpoint: Arc<dyn ExecutionHandler>) -> Result<(), TransportError> {
         let participant_id = endpoint.participant_id();
         if participant_id.kind != Kind::Participant {
             return Err(TransportError::InvalidParticipantIdentity);
@@ -323,7 +320,10 @@ mod tests {
     #[test]
     fn endpoint_transport_rejects_missing_endpoint() {
         let transport = EndpointTransport::new();
-        assert_eq!(transport.dispatch(request()).unwrap_err(), TransportError::EndpointUnavailable);
+        assert_eq!(
+            transport.dispatch(request()).unwrap_err(),
+            TransportError::EndpointUnavailable
+        );
     }
 
     #[test]
@@ -345,7 +345,10 @@ mod tests {
         );
         let transport = EndpointTransport::new();
         transport.register(first).unwrap();
-        assert_eq!(transport.register(second).unwrap_err(), TransportError::EndpointAlreadyRegistered);
+        assert_eq!(
+            transport.register(second).unwrap_err(),
+            TransportError::EndpointAlreadyRegistered
+        );
     }
 
     #[test]
