@@ -2,7 +2,7 @@ use crate::discovery::{Advertisement, Member, Registry as DiscoveryRegistry};
 use crate::execution::{ExecutionError, ExecutionPlan, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::lease::Lease;
-use crate::node::LogicalNode;
+use crate::node::{LogicalNode, NodeError, RuntimeSpec};
 use crate::participant::Participant;
 use crate::registry::Registry;
 use crate::resource::ResourceFragment;
@@ -17,6 +17,7 @@ pub enum ControlError {
     InvalidLeaseDuration,
     LeaseNotFound,
     Scheduler(SchedulerError),
+    Node(NodeError),
     Execution(ExecutionError),
 }
 
@@ -90,6 +91,16 @@ impl Plane {
         self.scheduler.plan(requirement)
     }
 
+    pub fn create_logical_node_with_runtime(
+        &self,
+        requirement: ResourceFragment,
+        runtime: RuntimeSpec,
+    ) -> Result<LogicalNode, ControlError> {
+        self.create_logical_node(requirement)?
+            .with_runtime(runtime)
+            .map_err(ControlError::Node)
+    }
+
     pub fn create_execution_plan(
         &self,
         node: &LogicalNode,
@@ -108,6 +119,19 @@ impl Plane {
         crate::execution::ExecutionDispatcher::new(transport)
             .dispatch(plan, workload, endpoints)
             .map_err(ControlError::Execution)
+    }
+
+    pub fn create_leased_logical_node_with_runtime(
+        &self,
+        requirement: ResourceFragment,
+        runtime: RuntimeSpec,
+        now: SystemTime,
+        duration: Duration,
+    ) -> Result<(LogicalNode, Vec<Lease>), ControlError> {
+        let (node, leases) =
+            self.create_leased_logical_node(requirement, now, duration)?;
+        let node = node.with_runtime(runtime).map_err(ControlError::Node)?;
+        Ok((node, leases))
     }
 
     pub fn create_leased_logical_node(
