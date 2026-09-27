@@ -78,6 +78,85 @@ impl ExecutionBackend for NoopBackend {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchReceipt {
+    pub workload_id: String,
+    pub node_id: Identity,
+    pub dispatched_units: usize,
+}
+
+impl DispatchReceipt {
+    fn from_responses(
+        workload_id: String,
+        node_id: Identity,
+        responses: usize,
+    ) -> Self {
+        Self {
+            workload_id,
+            node_id,
+            dispatched_units: responses,
+        }
+    }
+}
+
+pub struct ExecutionDispatcher<T> {
+    transport: T,
+}
+
+impl<T> ExecutionDispatcher<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+}
+
+impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
+    pub fn dispatch(
+        &self,
+        plan: &ExecutionPlan,
+        workload: &WorkItem,
+        endpoints: &[crate::transport::ExecutionEndpoint],
+    ) -> Result<DispatchReceipt, ExecutionError> {
+        if plan.workload_id != workload.id {
+            return Err(ExecutionError::WorkloadMismatch);
+        }
+        if plan.units.is_empty() {
+            return Err(ExecutionError::EmptyPlan);
+        }
+
+        let mut dispatched = 0;
+        for unit in &plan.units {
+            let endpoint = endpoints
+                .iter()
+                .find(|endpoint| endpoint.participant_id == unit.participant_id)
+                .ok_or(ExecutionError::BackendRejected)?;
+
+            let request = crate::transport::ExecutionRequest {
+                request_id: format!("{}:{}", workload.id, unit.participant_id.id),
+                workload: workload.clone(),
+                node_id: plan.node_id.clone(),
+                runtime: plan.runtime.clone(),
+                unit: unit.clone(),
+                endpoint: endpoint.clone(),
+            };
+
+            self.transport
+                .dispatch(request)
+                .map_err(|_| ExecutionError::BackendRejected)?;
+            dispatched += 1;
+        }
+
+        Ok(DispatchReceipt::from_responses(
+            workload.id.clone(),
+            plan.node_id.clone(),
+            dispatched,
+        ))
+    }
+}
+
 impl ExecutionPlan {
     pub fn from_node(node: &LogicalNode, workload: &WorkItem) -> Result<Self, ExecutionError> {
         if workload.id.is_empty() {
