@@ -1,7 +1,10 @@
+use crate::endpoint::ExecutionHandler;
 use crate::execution::{ExecutionUnit, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::node::RuntimeSpec;
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionEndpoint {
@@ -75,6 +78,43 @@ impl ExecutionResponse {
     }
 }
 
+#[derive(Default)]
+pub struct EndpointTransport {
+    endpoints: RwLock<BTreeMap<String, Arc<dyn ExecutionHandler>>>,
+}
+
+impl EndpointTransport {
+    pub fn new() -> Self { Self::default() }
+    pub fn register(&self, endpoint: Arc<dyn ExecutionHandler>) -> Result<(), TransportError> {
+        let participant_id = endpoint.participant_id();
+        if participant_id.kind != Kind::Participant { return Err(TransportError::InvalidParticipantIdentity); }
+        let mut endpoints = self.endpoints.write().expect("endpoint transport lock poisoned");
+        if endpoints.contains_key(&participant_id.id) { return Err(TransportError::EndpointAlreadyRegistered); }
+        endpoints.insert(participant_id.id.clone(), endpoint);
+        Ok(())
+    }
+    pub fn unregister(&self, participant_id: &Identity) -> Result<(), TransportError> {
+        if participant_id.kind != Kind::Participant { return Err(TransportError::InvalidParticipantIdentity); }
+        self.endpoints.write().expect("endpoint transport lock poisoned").remove(&participant_id.id);
+        Ok(())
+    }
+    pub fn len(&self) -> usize { self.endpoints.read().expect("endpoint transport lock poisoned").len() }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+impl Transport for EndpointTransport {
+    fn dispatch(&self, request: ExecutionRequest) -> Result<ExecutionResponse, TransportError> {
+        if request.request_id.is_empty() { return Err(TransportError::EmptyRequestId); }
+        if request.workload.id.is_empty() { return Err(TransportError::EmptyWorkloadId); }
+        if request.node_id.kind != Kind::LogicalNode { return Err(TransportError::InvalidNodeIdentity); }
+        if request.runtime.name.is_empty() || request.runtime.version.is_empty() { return Err(TransportError::InvalidRuntimeSpec); }
+        if request.unit.participant_id.kind != Kind::Participant { return Err(TransportError::InvalidParticipantIdentity); }
+        if request.endpoint.participant_id != request.unit.participant_id { return Err(TransportError::InvalidParticipantIdentity); }
+        let endpoint = self.endpoints.read().expect("endpoint transport lock poisoned").get(&request.unit.participant_id.id).cloned().ok_or(TransportError::EndpointUnavailable)?;
+        endpoint.handle_request(request).map_err(|_| TransportError::RequestRejected)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportError {
     EmptyRequestId,
@@ -85,6 +125,7 @@ pub enum TransportError {
     InvalidParticipantIdentity,
     InvalidRuntimeSpec,
     EndpointUnavailable,
+    EndpointAlreadyRegistered,
     RequestRejected,
 }
 
