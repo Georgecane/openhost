@@ -251,6 +251,72 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_transport_dispatches_to_registered_endpoint() {
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let transport = EndpointTransport::new();
+        transport.register(endpoint).unwrap();
+
+        let mut request = request();
+        request.unit.participant_id = participant_id.clone();
+        request.endpoint.participant_id = participant_id;
+
+        let response = transport.dispatch(request).unwrap();
+        assert_eq!(response.status, ExecutionStatus::Completed);
+        assert_eq!(transport.len(), 1);
+    }
+
+    #[test]
+    fn endpoint_transport_rejects_missing_endpoint() {
+        let transport = EndpointTransport::new();
+        assert_eq!(transport.dispatch(request()).unwrap_err(), TransportError::EndpointUnavailable);
+    }
+
+    #[test]
+    fn endpoint_transport_rejects_duplicate_registration() {
+        let participant_id = Identity::new(Kind::Participant);
+        let first = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let second = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id,
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let transport = EndpointTransport::new();
+        transport.register(first).unwrap();
+        assert_eq!(transport.register(second).unwrap_err(), TransportError::EndpointAlreadyRegistered);
+    }
+
+    #[test]
+    fn endpoint_transport_unregisters_endpoint() {
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let transport = EndpointTransport::new();
+        transport.register(endpoint).unwrap();
+        transport.unregister(&participant_id).unwrap();
+        assert!(transport.is_empty());
+    }
+
+    #[test]
     fn response_helpers_encode_terminal_states() {
         let completed = ExecutionResponse::completed("request-1");
         assert_eq!(completed.status, ExecutionStatus::Completed);
