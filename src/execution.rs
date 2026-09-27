@@ -86,11 +86,7 @@ pub struct DispatchReceipt {
 }
 
 impl DispatchReceipt {
-    fn from_responses(
-        workload_id: String,
-        node_id: Identity,
-        responses: usize,
-    ) -> Self {
+    fn from_responses(workload_id: String, node_id: Identity, responses: usize) -> Self {
         Self {
             workload_id,
             node_id,
