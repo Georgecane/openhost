@@ -127,8 +127,8 @@ impl Plane {
         endpoints: &[crate::transport::ExecutionEndpoint],
         transport: T,
     ) -> Result<crate::execution::DispatchReceipt, ControlError> {
-        crate::execution::ExecutionDispatcher::new(transport)
-            .dispatch(plan, workload, endpoints)
+        crate::execution::ExecutionDispatcher::new(transport, endpoints.to_vec())
+            .dispatch(plan, workload)
             .map_err(ControlError::Execution)
     }
 
