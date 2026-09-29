@@ -4,7 +4,6 @@ use crate::execution::{
 use crate::identity::{Identity, Kind};
 use crate::node::{LogicalNode, NodeError, RuntimeSpec};
 use crate::resource::ResourceFragment;
-use crate::transport::{EndpointTransport, ExecutionEndpoint};
 use std::fmt;
 use std::time::SystemTime;
 
@@ -238,6 +237,7 @@ mod tests {
     fn running_vm_dispatches_through_endpoint_transport_and_runtime_registry() {
         use crate::endpoint::{ParticipantExecutionEndpoint, RegistryRuntimeAdapter};
         use crate::execution::ExecutionDispatcher;
+        use crate::transport::{EndpointTransport, ExecutionEndpoint};
         use crate::runtime::{Runtime, RuntimeContext, RuntimeError, RuntimeRegistry};
         use std::sync::Arc;
 
