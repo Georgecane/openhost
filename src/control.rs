@@ -96,7 +96,8 @@ impl Plane {
         requirement: ResourceFragment,
         runtime: RuntimeSpec,
     ) -> Result<LogicalNode, ControlError> {
-        self.create_logical_node(requirement)?
+        self.create_logical_node(requirement)
+            .map_err(ControlError::Scheduler)?
             .with_runtime(runtime)
             .map_err(ControlError::Node)
     }
