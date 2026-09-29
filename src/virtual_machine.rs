@@ -4,6 +4,7 @@ use crate::execution::{
 use crate::identity::{Identity, Kind};
 use crate::node::{LogicalNode, NodeError, RuntimeSpec};
 use crate::resource::ResourceFragment;
+use crate::transport::{EndpointTransport, ExecutionEndpoint};
 use std::fmt;
 use std::time::SystemTime;
 
@@ -229,6 +230,69 @@ mod tests {
 
         assert_eq!(receipt.workload_id, workload.id);
         assert_eq!(receipt.node_id, vm.node_id);
+        assert_eq!(receipt.dispatched_units, 1);
+        assert_eq!(vm.state, VirtualMachineState::Running);
+    }
+
+    #[test]
+    fn running_vm_dispatches_through_endpoint_transport_and_runtime_registry() {
+        use crate::endpoint::{ParticipantExecutionEndpoint, RegistryRuntimeAdapter};
+        use crate::execution::ExecutionDispatcher;
+        use crate::runtime::{Runtime, RuntimeContext, RuntimeError, RuntimeRegistry};
+        use std::sync::Arc;
+
+        #[derive(Debug, Default)]
+        struct RecordingRuntime;
+
+        impl Runtime for RecordingRuntime {
+            fn name(&self) -> &str {
+                "wasm"
+            }
+
+            fn run(
+                &self,
+                _context: &RuntimeContext,
+                _workload: WorkItem,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+        }
+
+        let node = node();
+        let participant_id = Identity::parse(
+            &node.resources.allocations[0].participant_id,
+            Kind::Participant,
+        )
+        .unwrap();
+        let mut registry = RuntimeRegistry::default();
+        registry
+            .register(RuntimeSpec::new("wasm", "1"), Arc::new(RecordingRuntime))
+            .unwrap();
+
+        let endpoint = Arc::new(
+            ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                RegistryRuntimeAdapter::new(Arc::new(registry)),
+            )
+            .unwrap(),
+        );
+        let transport = EndpointTransport::new();
+        transport.register(endpoint).unwrap();
+
+        let endpoints = vec![
+            ExecutionEndpoint::new(participant_id, "loopback://participant-1").unwrap(),
+        ];
+        let dispatcher = ExecutionDispatcher::new(transport, endpoints);
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: vec![1, 2, 3],
+        };
+        let mut vm = VirtualMachine::from_node(&node, SystemTime::now()).unwrap();
+        vm.start().unwrap();
+
+        let receipt = vm.execute(&node, &workload, &dispatcher).unwrap();
+
+        assert_eq!(receipt.workload_id, workload.id);
         assert_eq!(receipt.dispatched_units, 1);
         assert_eq!(vm.state, VirtualMachineState::Running);
     }
