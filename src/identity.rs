@@ -6,6 +6,7 @@ pub enum Kind {
     Participant,
     LogicalNode,
     Lease,
+    VirtualMachine,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
