@@ -129,8 +129,7 @@ impl Plane {
         now: SystemTime,
         duration: Duration,
     ) -> Result<(LogicalNode, Vec<Lease>), ControlError> {
-        let (node, leases) =
-            self.create_leased_logical_node(requirement, now, duration)?;
+        let (node, leases) = self.create_leased_logical_node(requirement, now, duration)?;
         let node = node.with_runtime(runtime).map_err(ControlError::Node)?;
         Ok((node, leases))
     }
