@@ -1,4 +1,6 @@
-use crate::execution::{ExecutionBackend, ExecutionError, ExecutionPlan, ExecutionReceipt, WorkItem};
+use crate::execution::{
+    ExecutionBackend, ExecutionError, ExecutionPlan, ExecutionReceipt, WorkItem,
+};
 use crate::identity::{Identity, Kind};
 use crate::node::{LogicalNode, NodeError, RuntimeSpec};
 use crate::resource::ResourceFragment;
@@ -221,7 +223,9 @@ mod tests {
             payload: vec![1, 2, 3],
         };
 
-        let receipt = vm.execute(&node, &workload, &crate::execution::NoopBackend).unwrap();
+        let receipt = vm
+            .execute(&node, &workload, &crate::execution::NoopBackend)
+            .unwrap();
 
         assert_eq!(receipt.workload_id, workload.id);
         assert_eq!(receipt.node_id, vm.node_id);
