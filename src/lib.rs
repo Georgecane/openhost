@@ -13,3 +13,4 @@ pub mod resource;
 pub mod runtime;
 pub mod scheduler;
 pub mod transport;
+pub mod virtual_machine;
