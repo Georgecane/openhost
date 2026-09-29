@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn vm_rejects_empty_resources() {
         let mut node = node();
-        node.resources = CompositeResource::default();
+        node.resources.capacity = ResourceFragment::default();
 
         assert_eq!(
             VirtualMachine::from_node(&node, SystemTime::now()).unwrap_err(),
