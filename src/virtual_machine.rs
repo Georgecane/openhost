@@ -1,3 +1,4 @@
+use crate::execution::{ExecutionError, ExecutionPlan, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::node::{LogicalNode, NodeError, RuntimeSpec};
 use crate::resource::ResourceFragment;
@@ -50,6 +51,10 @@ pub enum VirtualMachineError {
     InvalidResources,
     InvalidRuntime(NodeError),
     EmptyResources,
+    NodeMismatch,
+    ResourceMismatch,
+    RuntimeMismatch,
+    Execution(ExecutionError),
 }
 
 impl fmt::Display for VirtualMachineError {
@@ -86,6 +91,26 @@ impl VirtualMachine {
             state: VirtualMachineState::Created,
             created_at,
         })
+    }
+
+    pub fn execution_plan(
+        &self,
+        node: &LogicalNode,
+        workload: &WorkItem,
+    ) -> Result<ExecutionPlan, VirtualMachineError> {
+        let node_id = Identity::parse(&node.id, Kind::LogicalNode)
+            .map_err(|_| VirtualMachineError::InvalidLogicalNodeIdentity)?;
+        if node_id != self.node_id {
+            return Err(VirtualMachineError::NodeMismatch);
+        }
+        if node.resources.capacity != self.spec.resources {
+            return Err(VirtualMachineError::ResourceMismatch);
+        }
+        if node.runtime != self.spec.runtime {
+            return Err(VirtualMachineError::RuntimeMismatch);
+        }
+
+        ExecutionPlan::from_node(node, workload).map_err(VirtualMachineError::Execution)
     }
 
     pub fn start(&mut self) -> Result<(), VirtualMachineError> {
