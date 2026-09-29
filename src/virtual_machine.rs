@@ -80,7 +80,7 @@ impl VirtualMachine {
         spec.validate()?;
 
         Ok(Self {
-            id: Identity::new(Kind::LogicalNode),
+            id: Identity::new(Kind::VirtualMachine),
             node_id,
             spec,
             state: VirtualMachineState::Created,
@@ -151,7 +151,7 @@ mod tests {
         let vm = VirtualMachine::from_node(&node, SystemTime::now()).unwrap();
 
         assert_ne!(vm.id.id, node.id);
-        assert_eq!(vm.id.kind, Kind::LogicalNode);
+        assert_eq!(vm.id.kind, Kind::VirtualMachine);
     }
 
     #[test]
