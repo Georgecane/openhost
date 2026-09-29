@@ -97,11 +97,18 @@ impl DispatchReceipt {
 
 pub struct ExecutionDispatcher<T> {
     transport: T,
+    endpoints: Vec<crate::transport::ExecutionEndpoint>,
 }
 
 impl<T> ExecutionDispatcher<T> {
-    pub fn new(transport: T) -> Self {
-        Self { transport }
+    pub fn new(
+        transport: T,
+        endpoints: Vec<crate::transport::ExecutionEndpoint>,
+    ) -> Self {
+        Self {
+            transport,
+            endpoints,
+        }
     }
 
     pub fn transport(&self) -> &T {
@@ -114,7 +121,6 @@ impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
         &self,
         plan: &ExecutionPlan,
         workload: &WorkItem,
-        endpoints: &[crate::transport::ExecutionEndpoint],
     ) -> Result<DispatchReceipt, ExecutionError> {
         if plan.workload_id != workload.id {
             return Err(ExecutionError::WorkloadMismatch);
@@ -125,7 +131,7 @@ impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
 
         let mut dispatched = 0;
         for unit in &plan.units {
-            let endpoint = endpoints
+            let endpoint = self.endpoints
                 .iter()
                 .find(|endpoint| endpoint.participant_id == unit.participant_id)
                 .ok_or(ExecutionError::BackendRejected)?;
@@ -150,6 +156,21 @@ impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
             plan.node_id.clone(),
             dispatched,
         ))
+    }
+}
+
+impl<T: crate::transport::Transport> ExecutionBackend for ExecutionDispatcher<T> {
+    fn execute(
+        &self,
+        plan: &ExecutionPlan,
+        workload: &WorkItem,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        let receipt = self.dispatch(plan, workload)?;
+        Ok(ExecutionReceipt {
+            workload_id: receipt.workload_id,
+            node_id: receipt.node_id,
+            dispatched_units: receipt.dispatched_units,
+        })
     }
 }
 
