@@ -1,4 +1,4 @@
-use crate::execution::{ExecutionError, ExecutionPlan, WorkItem};
+use crate::execution::{ExecutionBackend, ExecutionError, ExecutionPlan, ExecutionReceipt, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::node::{LogicalNode, NodeError, RuntimeSpec};
 use crate::resource::ResourceFragment;
@@ -55,6 +55,7 @@ pub enum VirtualMachineError {
     ResourceMismatch,
     RuntimeMismatch,
     Execution(ExecutionError),
+    NotRunning,
 }
 
 impl fmt::Display for VirtualMachineError {
@@ -111,6 +112,26 @@ impl VirtualMachine {
         }
 
         ExecutionPlan::from_node(node, workload).map_err(VirtualMachineError::Execution)
+    }
+
+    pub fn execute<B: ExecutionBackend>(
+        &mut self,
+        node: &LogicalNode,
+        workload: &WorkItem,
+        backend: &B,
+    ) -> Result<ExecutionReceipt, VirtualMachineError> {
+        if self.state != VirtualMachineState::Running {
+            return Err(VirtualMachineError::NotRunning);
+        }
+
+        let plan = self.execution_plan(node, workload)?;
+        match plan.execute(backend, workload) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => {
+                self.state = VirtualMachineState::Failed;
+                Err(VirtualMachineError::Execution(error))
+            }
+        }
     }
 
     pub fn start(&mut self) -> Result<(), VirtualMachineError> {
@@ -187,6 +208,40 @@ mod tests {
         assert_eq!(
             VirtualMachine::from_node(&node, SystemTime::now()).unwrap_err(),
             VirtualMachineError::InvalidRuntime(NodeError::EmptyRuntimeName)
+        );
+    }
+
+    #[test]
+    fn running_vm_executes_workload_through_existing_backend() {
+        let node = node();
+        let mut vm = VirtualMachine::from_node(&node, SystemTime::now()).unwrap();
+        vm.start().unwrap();
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: vec![1, 2, 3],
+        };
+
+        let receipt = vm.execute(&node, &workload, &crate::execution::NoopBackend).unwrap();
+
+        assert_eq!(receipt.workload_id, workload.id);
+        assert_eq!(receipt.node_id, vm.node_id);
+        assert_eq!(receipt.dispatched_units, 1);
+        assert_eq!(vm.state, VirtualMachineState::Running);
+    }
+
+    #[test]
+    fn created_vm_cannot_execute() {
+        let node = node();
+        let mut vm = VirtualMachine::from_node(&node, SystemTime::now()).unwrap();
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: Vec::new(),
+        };
+
+        assert_eq!(
+            vm.execute(&node, &workload, &crate::execution::NoopBackend)
+                .unwrap_err(),
+            VirtualMachineError::NotRunning
         );
     }
 
