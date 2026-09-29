@@ -6,6 +6,7 @@ use crate::node::{LogicalNode, NodeError, RuntimeSpec};
 use crate::participant::Participant;
 use crate::registry::Registry;
 use crate::resource::ResourceFragment;
+use crate::virtual_machine::{VirtualMachine, VirtualMachineError};
 use crate::scheduler::{Scheduler, SchedulerError};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -19,6 +20,7 @@ pub enum ControlError {
     Scheduler(SchedulerError),
     Node(NodeError),
     Execution(ExecutionError),
+    VirtualMachine(VirtualMachineError),
 }
 
 impl std::fmt::Display for ControlError {
@@ -100,6 +102,14 @@ impl Plane {
             .map_err(ControlError::Scheduler)?
             .with_runtime(runtime)
             .map_err(ControlError::Node)
+    }
+
+    pub fn create_virtual_machine(
+        &self,
+        node: &LogicalNode,
+        created_at: SystemTime,
+    ) -> Result<VirtualMachine, ControlError> {
+        VirtualMachine::from_node(node, created_at).map_err(ControlError::VirtualMachine)
     }
 
     pub fn create_execution_plan(
