@@ -237,8 +237,8 @@ mod tests {
     fn running_vm_dispatches_through_endpoint_transport_and_runtime_registry() {
         use crate::endpoint::{ParticipantExecutionEndpoint, RegistryRuntimeAdapter};
         use crate::execution::ExecutionDispatcher;
-        use crate::transport::{EndpointTransport, ExecutionEndpoint};
         use crate::runtime::{Runtime, RuntimeContext, RuntimeError, RuntimeRegistry};
+        use crate::transport::{EndpointTransport, ExecutionEndpoint};
         use std::sync::Arc;
 
         #[derive(Debug, Default)]
@@ -279,9 +279,8 @@ mod tests {
         let transport = EndpointTransport::new();
         transport.register(endpoint).unwrap();
 
-        let endpoints = vec![
-            ExecutionEndpoint::new(participant_id, "loopback://participant-1").unwrap(),
-        ];
+        let endpoints =
+            vec![ExecutionEndpoint::new(participant_id, "loopback://participant-1").unwrap()];
         let dispatcher = ExecutionDispatcher::new(transport, endpoints);
         let workload = WorkItem {
             id: "work-1".into(),
