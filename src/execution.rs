@@ -101,10 +101,7 @@ pub struct ExecutionDispatcher<T> {
 }
 
 impl<T> ExecutionDispatcher<T> {
-    pub fn new(
-        transport: T,
-        endpoints: Vec<crate::transport::ExecutionEndpoint>,
-    ) -> Self {
+    pub fn new(transport: T, endpoints: Vec<crate::transport::ExecutionEndpoint>) -> Self {
         Self {
             transport,
             endpoints,
@@ -131,7 +128,8 @@ impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
 
         let mut dispatched = 0;
         for unit in &plan.units {
-            let endpoint = self.endpoints
+            let endpoint = self
+                .endpoints
                 .iter()
                 .find(|endpoint| endpoint.participant_id == unit.participant_id)
                 .ok_or(ExecutionError::BackendRejected)?;
