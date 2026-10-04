@@ -53,7 +53,7 @@ jobs:
             binary: openhost
           - os: macos-latest
             artifact: openhost-macos
-            binary: openhost.exe
+            binary: openhost
           - os: windows-latest
             artifact: openhost-windows-x86_64
             binary: openhost.exe
