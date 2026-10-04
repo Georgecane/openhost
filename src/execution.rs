@@ -126,29 +126,42 @@ impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
             return Err(ExecutionError::EmptyPlan);
         }
 
-        let mut dispatched = 0;
-        for unit in &plan.units {
-            let endpoint = self
-                .endpoints
+        let requests = plan
+            .units
+            .iter()
+            .map(|unit| {
+                let endpoint = self
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.participant_id == unit.participant_id)
+                    .ok_or(ExecutionError::BackendRejected)?;
+
+                Ok(crate::transport::ExecutionRequest {
+                    request_id: format!("{}:{}", workload.id, unit.participant_id.id),
+                    workload: workload.clone(),
+                    node_id: plan.node_id.clone(),
+                    runtime: plan.runtime.clone(),
+                    unit: unit.clone(),
+                    endpoint: endpoint.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+
+        let responses = std::thread::scope(|scope| {
+            requests
                 .iter()
-                .find(|endpoint| endpoint.participant_id == unit.participant_id)
-                .ok_or(ExecutionError::BackendRejected)?;
+                .map(|request| scope.spawn(|| self.transport.dispatch(request.clone())))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().map_err(|_| ExecutionError::BackendRejected))
+                .collect::<Result<Vec<_>, ExecutionError>>()
+        })?;
 
-            let request = crate::transport::ExecutionRequest {
-                request_id: format!("{}:{}", workload.id, unit.participant_id.id),
-                workload: workload.clone(),
-                node_id: plan.node_id.clone(),
-                runtime: plan.runtime.clone(),
-                unit: unit.clone(),
-                endpoint: endpoint.clone(),
-            };
+        let mut dispatched = 0;
+        for (request, response) in requests.iter().zip(responses) {
+            let response = response.map_err(|_| ExecutionError::BackendRejected)?;
 
-            let response = self
-                .transport
-                .dispatch(request)
-                .map_err(|_| ExecutionError::BackendRejected)?;
-
-            if response.request_id != format!("{}:{}", workload.id, unit.participant_id.id) {
+            if response.request_id != request.request_id {
                 return Err(ExecutionError::BackendRejected);
             }
 
@@ -425,6 +438,52 @@ mod tests {
             let receipt = dispatcher.dispatch(&plan, &workload).unwrap();
             assert_eq!(receipt.dispatched_units, 2);
         }
+    }
+
+
+    #[test]
+    fn dispatcher_dispatches_units_concurrently() {
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        struct BlockingTransport {
+            barrier: Arc<Barrier>,
+        }
+
+        impl crate::transport::Transport for BlockingTransport {
+            fn dispatch(
+                &self,
+                request: crate::transport::ExecutionRequest,
+            ) -> Result<crate::transport::ExecutionResponse, crate::transport::TransportError> {
+                self.barrier.wait();
+                Ok(crate::transport::ExecutionResponse::completed(request.request_id))
+            }
+        }
+
+        let workload = WorkItem {
+            id: "work-concurrent".into(),
+            payload: Vec::new(),
+        };
+        let plan_node = node();
+        let plan = ExecutionPlan::from_node(&plan_node, &workload).unwrap();
+        let dispatcher = ExecutionDispatcher::new(
+            BlockingTransport {
+                barrier: Arc::new(Barrier::new(plan.units.len())),
+            },
+            dispatcher_with_status(&plan_node, crate::transport::ExecutionStatus::Completed)
+                .endpoints
+                .clone(),
+        );
+
+        let result = std::thread::spawn(move || dispatcher.dispatch(&plan, &workload))
+            .join();
+
+        assert!(
+            result.is_ok(),
+            "dispatcher did not complete concurrent dispatch"
+        );
+        assert_eq!(result.unwrap().unwrap().dispatched_units, 2);
+        let _ = Duration::from_secs(0);
     }
 
     #[test]
