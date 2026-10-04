@@ -198,10 +198,10 @@ impl Plane {
             self.release_leases(&vm.leases)?;
         }
 
-        self.logical_nodes.write().expect("logical node registry lock poisoned").remove(&vm.node_id.id);
-        if !vm.leases.is_empty() {
-            self.release_leases(&vm.leases)?;
-        }
+        self.logical_nodes
+            .write()
+            .expect("logical node registry lock poisoned")
+            .remove(&vm.node_id.id);
         Ok(vm)
     }
 
@@ -490,6 +490,48 @@ mod leased_vm_tests {
         assert_eq!(receipt.node_id, vm.node_id);
         assert_eq!(receipt.dispatched_units, 1);
         assert_eq!(plane.get_virtual_machine(&vm.id).unwrap().state, crate::virtual_machine::VirtualMachineState::Running);
+    }
+
+    #[test]
+    fn control_plane_vm_survives_fabric_resource_change() {
+        let plane = plane();
+        let participant = active_participant();
+        let participant_id = participant.id.clone();
+        plane.register_participant(participant).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        plane.start_virtual_machine(&vm.id).unwrap();
+
+        plane.registry.remove(&participant_id).unwrap();
+
+        let workload = WorkItem {
+            id: "fabric-changed-workload".into(),
+            payload: vec![7, 8, 9],
+        };
+        let receipt = plane
+            .execute_virtual_machine(&vm.id, &workload, &crate::execution::NoopBackend)
+            .unwrap();
+
+        assert_eq!(receipt.workload_id, workload.id);
+        assert_eq!(receipt.node_id, vm.node_id);
+        assert_eq!(receipt.dispatched_units, 1);
+        assert_eq!(
+            plane.get_virtual_machine(&vm.id).unwrap().state,
+            crate::virtual_machine::VirtualMachineState::Running
+        );
+        assert_eq!(plane.get_lease(&leases[0].id).unwrap(), leases[0]);
     }
 
     #[test]
