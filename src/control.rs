@@ -1,5 +1,5 @@
 use crate::discovery::{Advertisement, Member, Registry as DiscoveryRegistry};
-use crate::execution::{ExecutionError, ExecutionPlan, WorkItem};
+use crate::execution::{ExecutionBackend, ExecutionError, ExecutionPlan, ExecutionReceipt, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::lease::Lease;
 use crate::node::{LogicalNode, NodeError, RuntimeSpec};
@@ -37,6 +37,7 @@ pub struct Plane {
     scheduler: Arc<dyn Scheduler>,
     leases: RwLock<BTreeMap<String, Lease>>,
     virtual_machines: RwLock<BTreeMap<String, VirtualMachine>>,
+    logical_nodes: RwLock<BTreeMap<String, LogicalNode>>,
 }
 
 impl Plane {
@@ -51,6 +52,7 @@ impl Plane {
             scheduler,
             leases: RwLock::new(BTreeMap::new()),
             virtual_machines: RwLock::new(BTreeMap::new()),
+            logical_nodes: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -112,7 +114,10 @@ impl Plane {
         node: &LogicalNode,
         created_at: SystemTime,
     ) -> Result<VirtualMachine, ControlError> {
-        VirtualMachine::from_node(node, created_at).map_err(ControlError::VirtualMachine)
+        let vm = VirtualMachine::from_node(node, created_at).map_err(ControlError::VirtualMachine)?;
+        self.logical_nodes.write().expect("logical node registry lock poisoned").insert(node.id.clone(), node.clone());
+        self.virtual_machines.write().expect("virtual machine registry lock poisoned").insert(vm.id.id.clone(), vm.clone());
+        Ok(vm)
     }
 
     pub fn create_leased_virtual_machine(
@@ -131,10 +136,8 @@ impl Plane {
 
         match VirtualMachine::from_leased_node(&node, leases.clone(), created_at) {
             Ok(vm) => {
-                self.virtual_machines
-                    .write()
-                    .expect("virtual machine registry lock poisoned")
-                    .insert(vm.id.id.clone(), vm.clone());
+                self.logical_nodes.write().expect("logical node registry lock poisoned").insert(node.id.clone(), node.clone());
+                self.virtual_machines.write().expect("virtual machine registry lock poisoned").insert(vm.id.id.clone(), vm.clone());
                 Ok((vm, leases))
             }
             Err(error) => {
@@ -195,7 +198,27 @@ impl Plane {
             self.release_leases(&vm.leases)?;
         }
 
+        self.logical_nodes.write().expect("logical node registry lock poisoned").remove(&vm.node_id.id);
+        if !vm.leases.is_empty() {
+            self.release_leases(&vm.leases)?;
+        }
         Ok(vm)
+    }
+
+    pub fn execute_virtual_machine<B: ExecutionBackend>(
+        &self,
+        id: &Identity,
+        workload: &WorkItem,
+        backend: &B,
+    ) -> Result<ExecutionReceipt, ControlError> {
+        let mut vm = self.virtual_machines.write().expect("virtual machine registry lock poisoned")
+            .remove(&id.id).ok_or(ControlError::VirtualMachineNotFound)?;
+        let node = self.logical_nodes.read().expect("logical node registry lock poisoned")
+            .get(&vm.node_id.id).cloned().ok_or(ControlError::VirtualMachineNotFound)?;
+        let result = vm.execute(&node, workload, backend);
+        self.virtual_machines.write().expect("virtual machine registry lock poisoned")
+            .insert(vm.id.id.clone(), vm);
+        result.map_err(ControlError::VirtualMachine)
     }
 
     pub fn release_lease(&self, id: &Identity) -> Result<Lease, ControlError> {
@@ -449,6 +472,61 @@ mod leased_vm_tests {
                 ControlError::LeaseNotFound
             );
         }
+    }
+
+    #[test]
+    fn control_plane_executes_workload_through_owned_vm() {
+        let plane = plane();
+        plane.register_participant(active_participant()).unwrap();
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (vm, _) = plane.create_leased_virtual_machine(
+            ResourceFragment { cpu: crate::resource::Cpu { cores: 1.0 }, ..Default::default() },
+            RuntimeSpec::new("wasm", "1"), created_at, Duration::from_secs(60),
+        ).unwrap();
+        plane.start_virtual_machine(&vm.id).unwrap();
+        let workload = WorkItem { id: "control-plane-workload".into(), payload: vec![1,2,3] };
+        let receipt = plane.execute_virtual_machine(&vm.id, &workload, &crate::execution::NoopBackend).unwrap();
+        assert_eq!(receipt.workload_id, workload.id);
+        assert_eq!(receipt.node_id, vm.node_id);
+        assert_eq!(receipt.dispatched_units, 1);
+        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap().state, crate::virtual_machine::VirtualMachineState::Running);
+    }
+
+    #[test]
+    fn control_plane_execution_rejects_stopped_vm() {
+        let plane = plane();
+        plane.register_participant(active_participant()).unwrap();
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (vm, _) = plane.create_leased_virtual_machine(
+            ResourceFragment { cpu: crate::resource::Cpu { cores: 1.0 }, ..Default::default() },
+            RuntimeSpec::new("wasm", "1"), created_at, Duration::from_secs(60),
+        ).unwrap();
+        let workload = WorkItem { id: "stopped-workload".into(), payload: Vec::new() };
+        assert_eq!(plane.execute_virtual_machine(&vm.id, &workload, &crate::execution::NoopBackend).unwrap_err(),
+            ControlError::VirtualMachine(VirtualMachineError::NotRunning));
+    }
+
+    #[test]
+    fn control_plane_execution_marks_vm_failed_on_backend_error() {
+        #[derive(Debug, Clone, Copy)]
+        struct FailingBackend;
+        impl ExecutionBackend for FailingBackend {
+            fn execute(&self, _: &ExecutionPlan, _: &WorkItem) -> Result<ExecutionReceipt, ExecutionError> {
+                Err(ExecutionError::BackendRejected)
+            }
+        }
+        let plane = plane();
+        plane.register_participant(active_participant()).unwrap();
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (vm, _) = plane.create_leased_virtual_machine(
+            ResourceFragment { cpu: crate::resource::Cpu { cores: 1.0 }, ..Default::default() },
+            RuntimeSpec::new("wasm", "1"), created_at, Duration::from_secs(60),
+        ).unwrap();
+        plane.start_virtual_machine(&vm.id).unwrap();
+        let workload = WorkItem { id: "failed-workload".into(), payload: Vec::new() };
+        assert_eq!(plane.execute_virtual_machine(&vm.id, &workload, &FailingBackend).unwrap_err(),
+            ControlError::VirtualMachine(VirtualMachineError::Execution(ExecutionError::BackendRejected)));
+        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap().state, crate::virtual_machine::VirtualMachineState::Failed);
     }
 
     #[test]
