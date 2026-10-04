@@ -143,10 +143,27 @@ impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
                 endpoint: endpoint.clone(),
             };
 
-            self.transport
+            let response = self
+                .transport
                 .dispatch(request)
                 .map_err(|_| ExecutionError::BackendRejected)?;
-            dispatched += 1;
+
+            if response.request_id != format!("{}:{}", workload.id, unit.participant_id.id) {
+                return Err(ExecutionError::BackendRejected);
+            }
+
+            match response.status {
+                crate::transport::ExecutionStatus::Dispatched
+                | crate::transport::ExecutionStatus::Running
+                | crate::transport::ExecutionStatus::Completed => {
+                    dispatched += 1;
+                }
+                crate::transport::ExecutionStatus::Pending
+                | crate::transport::ExecutionStatus::Failed
+                | crate::transport::ExecutionStatus::Cancelled => {
+                    return Err(ExecutionError::BackendRejected);
+                }
+            }
         }
 
         Ok(DispatchReceipt::from_responses(
@@ -351,6 +368,120 @@ mod tests {
         assert_eq!(receipt.workload_id, "work-1");
         assert_eq!(receipt.node_id, plan.node_id);
         assert_eq!(receipt.dispatched_units, 2);
+    }
+
+    #[derive(Clone, Copy)]
+    struct StatusTransport(crate::transport::ExecutionStatus);
+
+    impl crate::transport::Transport for StatusTransport {
+        fn dispatch(
+            &self,
+            request: crate::transport::ExecutionRequest,
+        ) -> Result<crate::transport::ExecutionResponse, crate::transport::TransportError> {
+            Ok(crate::transport::ExecutionResponse {
+                request_id: request.request_id,
+                status: self.0,
+                error: None,
+            })
+        }
+    }
+
+    fn dispatcher_with_status(
+        status: crate::transport::ExecutionStatus,
+    ) -> ExecutionDispatcher<StatusTransport> {
+        let node = node();
+        let endpoints = node
+            .resources
+            .allocations
+            .iter()
+            .map(|allocation| {
+                let participant_id =
+                    Identity::parse(&allocation.participant_id, Kind::Participant).unwrap();
+                crate::transport::ExecutionEndpoint::new(
+                    participant_id,
+                    "loopback://participant",
+                )
+                .unwrap()
+            })
+            .collect();
+        ExecutionDispatcher::new(StatusTransport(status), endpoints)
+    }
+
+    #[test]
+    fn dispatcher_accepts_non_terminal_execution_statuses() {
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
+
+        for status in [
+            crate::transport::ExecutionStatus::Dispatched,
+            crate::transport::ExecutionStatus::Running,
+            crate::transport::ExecutionStatus::Completed,
+        ] {
+            let dispatcher = dispatcher_with_status(status);
+            let receipt = dispatcher.dispatch(&plan, &workload).unwrap();
+            assert_eq!(receipt.dispatched_units, 2);
+        }
+    }
+
+    #[test]
+    fn dispatcher_rejects_non_success_execution_statuses() {
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
+
+        for status in [
+            crate::transport::ExecutionStatus::Pending,
+            crate::transport::ExecutionStatus::Failed,
+            crate::transport::ExecutionStatus::Cancelled,
+        ] {
+            let dispatcher = dispatcher_with_status(status);
+            assert_eq!(
+                dispatcher.dispatch(&plan, &workload).unwrap_err(),
+                ExecutionError::BackendRejected
+            );
+        }
+    }
+
+    #[test]
+    fn dispatcher_rejects_response_id_mismatch() {
+        #[derive(Clone, Copy)]
+        struct MismatchedResponseTransport;
+
+        impl crate::transport::Transport for MismatchedResponseTransport {
+            fn dispatch(
+                &self,
+                request: crate::transport::ExecutionRequest,
+            ) -> Result<crate::transport::ExecutionResponse, crate::transport::TransportError>
+            {
+                Ok(crate::transport::ExecutionResponse {
+                    request_id: format!("{}:unexpected", request.workload.id),
+                    status: crate::transport::ExecutionStatus::Completed,
+                    error: None,
+                })
+            }
+        }
+
+        let workload = WorkItem {
+            id: "work-1".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
+        let dispatcher = ExecutionDispatcher::new(
+            MismatchedResponseTransport,
+            dispatcher_with_status(crate::transport::ExecutionStatus::Completed)
+                .endpoints
+                .clone(),
+        );
+
+        assert_eq!(
+            dispatcher.dispatch(&plan, &workload).unwrap_err(),
+            ExecutionError::BackendRejected
+        );
     }
 
     #[test]
