@@ -387,9 +387,9 @@ mod tests {
     }
 
     fn dispatcher_with_status(
+        node: &LogicalNode,
         status: crate::transport::ExecutionStatus,
     ) -> ExecutionDispatcher<StatusTransport> {
-        let node = node();
         let endpoints = node
             .resources
             .allocations
@@ -413,14 +413,15 @@ mod tests {
             id: "work-1".into(),
             payload: Vec::new(),
         };
-        let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
+        let plan_node = node();
+        let plan = ExecutionPlan::from_node(&plan_node, &workload).unwrap();
 
         for status in [
             crate::transport::ExecutionStatus::Dispatched,
             crate::transport::ExecutionStatus::Running,
             crate::transport::ExecutionStatus::Completed,
         ] {
-            let dispatcher = dispatcher_with_status(status);
+            let dispatcher = dispatcher_with_status(&plan_node, status);
             let receipt = dispatcher.dispatch(&plan, &workload).unwrap();
             assert_eq!(receipt.dispatched_units, 2);
         }
@@ -432,7 +433,8 @@ mod tests {
             id: "work-1".into(),
             payload: Vec::new(),
         };
-        let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
+        let plan_node = node();
+        let plan = ExecutionPlan::from_node(&plan_node, &workload).unwrap();
 
         for status in [
             crate::transport::ExecutionStatus::Pending,
@@ -470,10 +472,11 @@ mod tests {
             id: "work-1".into(),
             payload: Vec::new(),
         };
-        let plan = ExecutionPlan::from_node(&node(), &workload).unwrap();
+        let plan_node = node();
+        let plan = ExecutionPlan::from_node(&plan_node, &workload).unwrap();
         let dispatcher = ExecutionDispatcher::new(
             MismatchedResponseTransport,
-            dispatcher_with_status(crate::transport::ExecutionStatus::Completed)
+            dispatcher_with_status(&plan_node, crate::transport::ExecutionStatus::Completed)
                 .endpoints
                 .clone(),
         );
