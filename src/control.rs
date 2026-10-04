@@ -408,7 +408,7 @@ mod leased_vm_tests {
         let participant = active_participant();
         plane.register_participant(Arc::clone(&participant)).unwrap();
 
-        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let created_at = SystemTime::now();
         let (vm, leases) = plane
             .create_leased_virtual_machine(
                 ResourceFragment {
@@ -496,7 +496,7 @@ mod leased_vm_tests {
     fn control_plane_vm_survives_fabric_resource_change() {
         let plane = plane();
         let participant = active_participant();
-        let participant_id = participant.id.clone();
+        let participant_id = participant.snapshot().id;
         plane.register_participant(participant).unwrap();
 
         let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
