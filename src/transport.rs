@@ -2,9 +2,10 @@ use crate::endpoint::ExecutionHandler;
 use crate::execution::{ExecutionUnit, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::node::RuntimeSpec;
+use crate::resource::ResourceFragment;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 
@@ -162,7 +163,7 @@ impl Transport for EndpointTransport {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TcpEndpointServer {
     listener: Arc<TcpListener>,
     endpoint: Arc<dyn ExecutionHandler>,
