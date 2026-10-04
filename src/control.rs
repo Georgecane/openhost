@@ -211,14 +211,24 @@ impl Plane {
         workload: &WorkItem,
         backend: &B,
     ) -> Result<ExecutionReceipt, ControlError> {
-        let mut vm = self.virtual_machines.write().expect("virtual machine registry lock poisoned")
-            .remove(&id.id).ok_or(ControlError::VirtualMachineNotFound)?;
-        let node = self.logical_nodes.read().expect("logical node registry lock poisoned")
-            .get(&vm.node_id.id).cloned().ok_or(ControlError::VirtualMachineNotFound)?;
-        let result = vm.execute(&node, workload, backend);
-        self.virtual_machines.write().expect("virtual machine registry lock poisoned")
-            .insert(vm.id.id.clone(), vm);
-        result.map_err(ControlError::VirtualMachine)
+        let mut vms = self
+            .virtual_machines
+            .write()
+            .expect("virtual machine registry lock poisoned");
+        let vm = vms
+            .get_mut(&id.id)
+            .ok_or(ControlError::VirtualMachineNotFound)?;
+
+        let node = self
+            .logical_nodes
+            .read()
+            .expect("logical node registry lock poisoned")
+            .get(&vm.node_id.id)
+            .cloned()
+            .ok_or(ControlError::VirtualMachineNotFound)?;
+
+        vm.execute(&node, workload, backend)
+            .map_err(ControlError::VirtualMachine)
     }
 
     pub fn release_lease(&self, id: &Identity) -> Result<Lease, ControlError> {
@@ -490,6 +500,86 @@ mod leased_vm_tests {
         assert_eq!(receipt.node_id, vm.node_id);
         assert_eq!(receipt.dispatched_units, 1);
         assert_eq!(plane.get_virtual_machine(&vm.id).unwrap().state, crate::virtual_machine::VirtualMachineState::Running);
+    }
+
+    #[test]
+    fn control_plane_vm_remains_visible_during_execution() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        #[derive(Debug, Clone)]
+        struct BlockingBackend {
+            started: Arc<Barrier>,
+            release: Arc<Barrier>,
+        }
+
+        impl ExecutionBackend for BlockingBackend {
+            fn execute(
+                &self,
+                _: &ExecutionPlan,
+                workload: &WorkItem,
+            ) -> Result<ExecutionReceipt, ExecutionError> {
+                self.started.wait();
+                self.release.wait();
+                Ok(ExecutionReceipt {
+                    workload_id: workload.id.clone(),
+                    node_id: Identity::new(Kind::LogicalNode),
+                    dispatched_units: 1,
+                })
+            }
+        }
+
+        let plane = Arc::new(plane());
+        plane.register_participant(active_participant()).unwrap();
+
+        let created_at = SystemTime::now();
+        let (vm, _) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        plane.start_virtual_machine(&vm.id).unwrap();
+
+        let started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let backend = BlockingBackend {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        };
+        let workload = WorkItem {
+            id: "concurrent-workload".into(),
+            payload: Vec::new(),
+        };
+
+        let execute_plane = Arc::clone(&plane);
+        let execute_id = vm.id.clone();
+        let execute_handle = thread::spawn(move || {
+            execute_plane.execute_virtual_machine(&execute_id, &workload, &backend)
+        });
+
+        started.wait();
+
+        let lookup_plane = Arc::clone(&plane);
+        let lookup_id = vm.id.clone();
+        let lookup_handle = thread::spawn(move || lookup_plane.get_virtual_machine(&lookup_id));
+
+        release.wait();
+
+        let receipt = execute_handle.join().unwrap().unwrap();
+        let visible_vm = lookup_handle.join().unwrap().unwrap();
+
+        assert_eq!(receipt.workload_id, "concurrent-workload");
+        assert_eq!(visible_vm.id, vm.id);
+        assert_eq!(
+            visible_vm.state,
+            crate::virtual_machine::VirtualMachineState::Running
+        );
     }
 
     #[test]
