@@ -17,6 +17,7 @@ pub enum ControlError {
     InvalidTime,
     InvalidLeaseDuration,
     LeaseNotFound,
+    VirtualMachineNotFound,
     Scheduler(SchedulerError),
     Node(NodeError),
     Execution(ExecutionError),
@@ -35,6 +36,7 @@ pub struct Plane {
     discovery: Arc<dyn DiscoveryRegistry>,
     scheduler: Arc<dyn Scheduler>,
     leases: RwLock<BTreeMap<String, Lease>>,
+    virtual_machines: RwLock<BTreeMap<String, VirtualMachine>>,
 }
 
 impl Plane {
@@ -48,6 +50,7 @@ impl Plane {
             discovery,
             scheduler,
             leases: RwLock::new(BTreeMap::new()),
+            virtual_machines: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -127,12 +130,72 @@ impl Plane {
         )?;
 
         match VirtualMachine::from_leased_node(&node, leases.clone(), created_at) {
-            Ok(vm) => Ok((vm, leases)),
+            Ok(vm) => {
+                self.virtual_machines
+                    .write()
+                    .expect("virtual machine registry lock poisoned")
+                    .insert(vm.id.id.clone(), vm.clone());
+                Ok((vm, leases))
+            }
             Err(error) => {
                 self.remove_leases(&leases);
                 Err(ControlError::VirtualMachine(error))
             }
         }
+    }
+
+    pub fn get_virtual_machine(&self, id: &Identity) -> Result<VirtualMachine, ControlError> {
+        if id.kind != Kind::VirtualMachine || id.validate().is_err() {
+            return Err(ControlError::VirtualMachineNotFound);
+        }
+
+        self.virtual_machines
+            .read()
+            .expect("virtual machine registry lock poisoned")
+            .get(&id.id)
+            .cloned()
+            .ok_or(ControlError::VirtualMachineNotFound)
+    }
+
+    pub fn start_virtual_machine(&self, id: &Identity) -> Result<VirtualMachine, ControlError> {
+        let mut vms = self
+            .virtual_machines
+            .write()
+            .expect("virtual machine registry lock poisoned");
+        let vm = vms
+            .get_mut(&id.id)
+            .ok_or(ControlError::VirtualMachineNotFound)?;
+        vm.start().map_err(ControlError::VirtualMachine)?;
+        Ok(vm.clone())
+    }
+
+    pub fn stop_virtual_machine(&self, id: &Identity) -> Result<VirtualMachine, ControlError> {
+        let mut vms = self
+            .virtual_machines
+            .write()
+            .expect("virtual machine registry lock poisoned");
+        let vm = vms
+            .get_mut(&id.id)
+            .ok_or(ControlError::VirtualMachineNotFound)?;
+        vm.stop().map_err(ControlError::VirtualMachine)?;
+        Ok(vm.clone())
+    }
+
+    pub fn destroy_virtual_machine(&self, id: &Identity) -> Result<VirtualMachine, ControlError> {
+        let vm = {
+            let mut vms = self
+                .virtual_machines
+                .write()
+                .expect("virtual machine registry lock poisoned");
+            vms.remove(&id.id)
+                .ok_or(ControlError::VirtualMachineNotFound)?
+        };
+
+        if !vm.leases.is_empty() {
+            self.release_leases(&vm.leases)?;
+        }
+
+        Ok(vm)
     }
 
     pub fn release_lease(&self, id: &Identity) -> Result<Lease, ControlError> {
@@ -339,6 +402,52 @@ mod leased_vm_tests {
         assert_eq!(vm.node_id.kind, Kind::LogicalNode);
         for lease in &leases {
             assert_eq!(plane.get_lease(&lease.id).unwrap(), *lease);
+        }
+    }
+
+
+    #[test]
+    fn control_plane_owns_virtual_machine_lifecycle() {
+        let plane = plane();
+        plane.register_participant(active_participant()).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap(), vm);
+
+        let started = plane.start_virtual_machine(&vm.id).unwrap();
+        assert_eq!(started.state, crate::virtual_machine::VirtualMachineState::Running);
+        assert_eq!(
+            plane.get_virtual_machine(&vm.id).unwrap().state,
+            crate::virtual_machine::VirtualMachineState::Running
+        );
+
+        let stopped = plane.stop_virtual_machine(&vm.id).unwrap();
+        assert_eq!(stopped.state, crate::virtual_machine::VirtualMachineState::Stopped);
+
+        let destroyed = plane.destroy_virtual_machine(&vm.id).unwrap();
+        assert_eq!(destroyed.id, vm.id);
+
+        assert_eq!(
+            plane.get_virtual_machine(&vm.id).unwrap_err(),
+            ControlError::VirtualMachineNotFound
+        );
+        for lease in leases {
+            assert_eq!(
+                plane.get_lease(&lease.id).unwrap_err(),
+                ControlError::LeaseNotFound
+            );
         }
     }
 
