@@ -297,6 +297,209 @@ mod tests {
     }
 
     #[test]
+    fn running_vm_dispatches_to_all_participants() {
+        use crate::endpoint::{ParticipantExecutionEndpoint, RegistryRuntimeAdapter};
+        use crate::execution::ExecutionDispatcher;
+        use crate::runtime::{Runtime, RuntimeContext, RuntimeError, RuntimeRegistry};
+        use crate::transport::{EndpointTransport, ExecutionEndpoint};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct CountingRuntime {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl Runtime for CountingRuntime {
+            fn name(&self) -> &str {
+                "wasm"
+            }
+
+            fn run(
+                &self,
+                _context: &RuntimeContext,
+                _workload: WorkItem,
+            ) -> Result<(), RuntimeError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let participant_a = Identity::new(Kind::Participant);
+        let participant_b = Identity::new(Kind::Participant);
+        let resources = CompositeResource::compose(vec![
+            Allocation {
+                participant_id: participant_a.id.clone(),
+                resources: ResourceFragment {
+                    cpu: Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+            },
+            Allocation {
+                participant_id: participant_b.id.clone(),
+                resources: ResourceFragment {
+                    cpu: Cpu { cores: 2.0 },
+                    ..Default::default()
+                },
+            },
+        ])
+        .unwrap();
+        let node = LogicalNode {
+            id: Identity::new(Kind::LogicalNode).id,
+            resources,
+            runtime: RuntimeSpec::new("wasm", "1"),
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = RuntimeRegistry::default();
+        registry
+            .register(
+                RuntimeSpec::new("wasm", "1"),
+                Arc::new(CountingRuntime {
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .unwrap();
+        let registry = Arc::new(registry);
+
+        let endpoint_a = Arc::new(
+            ParticipantExecutionEndpoint::new(
+                participant_a.clone(),
+                RegistryRuntimeAdapter::new(Arc::clone(&registry)),
+            )
+            .unwrap(),
+        );
+        let endpoint_b = Arc::new(
+            ParticipantExecutionEndpoint::new(
+                participant_b.clone(),
+                RegistryRuntimeAdapter::new(registry),
+            )
+            .unwrap(),
+        );
+
+        let transport = EndpointTransport::new();
+        transport.register(endpoint_a).unwrap();
+        transport.register(endpoint_b).unwrap();
+
+        let endpoints = vec![
+            ExecutionEndpoint::new(participant_a, "loopback://participant-a").unwrap(),
+            ExecutionEndpoint::new(participant_b, "loopback://participant-b").unwrap(),
+        ];
+        let dispatcher = ExecutionDispatcher::new(transport, endpoints);
+        let workload = WorkItem {
+            id: "work-distributed".into(),
+            payload: vec![1, 2, 3],
+        };
+        let mut vm = VirtualMachine::from_node(&node, SystemTime::now()).unwrap();
+        vm.start().unwrap();
+
+        let receipt = vm.execute(&node, &workload, &dispatcher).unwrap();
+
+        assert_eq!(receipt.dispatched_units, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(vm.state, VirtualMachineState::Running);
+    }
+
+    #[test]
+    fn vm_fails_when_one_participant_execution_fails() {
+        use crate::endpoint::{ParticipantExecutionEndpoint, RegistryRuntimeAdapter};
+        use crate::execution::ExecutionDispatcher;
+        use crate::runtime::{Runtime, RuntimeContext, RuntimeError, RuntimeRegistry};
+        use crate::transport::{EndpointTransport, ExecutionEndpoint};
+        use std::sync::Arc;
+
+        #[derive(Debug, Default)]
+        struct FailingRuntime;
+
+        impl Runtime for FailingRuntime {
+            fn name(&self) -> &str {
+                "wasm"
+            }
+
+            fn run(
+                &self,
+                _context: &RuntimeContext,
+                _workload: WorkItem,
+            ) -> Result<(), RuntimeError> {
+                Err(RuntimeError::ExecutionFailed)
+            }
+        }
+
+        let participant_a = Identity::new(Kind::Participant);
+        let participant_b = Identity::new(Kind::Participant);
+        let resources = CompositeResource::compose(vec![
+            Allocation {
+                participant_id: participant_a.id.clone(),
+                resources: ResourceFragment {
+                    cpu: Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+            },
+            Allocation {
+                participant_id: participant_b.id.clone(),
+                resources: ResourceFragment {
+                    cpu: Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+            },
+        ])
+        .unwrap();
+        let node = LogicalNode {
+            id: Identity::new(Kind::LogicalNode).id,
+            resources,
+            runtime: RuntimeSpec::new("wasm", "1"),
+        };
+
+        let mut registry = RuntimeRegistry::default();
+        registry
+            .register(
+                RuntimeSpec::new("wasm", "1"),
+                Arc::new(FailingRuntime),
+            )
+            .unwrap();
+        let registry = Arc::new(registry);
+
+        let endpoint_a = Arc::new(
+            ParticipantExecutionEndpoint::new(
+                participant_a.clone(),
+                RegistryRuntimeAdapter::new(Arc::clone(&registry)),
+            )
+            .unwrap(),
+        );
+        let endpoint_b = Arc::new(
+            ParticipantExecutionEndpoint::new(
+                participant_b.clone(),
+                RegistryRuntimeAdapter::new(registry),
+            )
+            .unwrap(),
+        );
+
+        let transport = EndpointTransport::new();
+        transport.register(endpoint_a).unwrap();
+        transport.register(endpoint_b).unwrap();
+
+        let endpoints = vec![
+            ExecutionEndpoint::new(participant_a, "loopback://participant-a").unwrap(),
+            ExecutionEndpoint::new(participant_b, "loopback://participant-b").unwrap(),
+        ];
+        let dispatcher = ExecutionDispatcher::new(transport, endpoints);
+        let workload = WorkItem {
+            id: "work-failing".into(),
+            payload: vec![1, 2, 3],
+        };
+        let mut vm = VirtualMachine::from_node(&node, SystemTime::now()).unwrap();
+        vm.start().unwrap();
+
+        let error = vm.execute(&node, &workload, &dispatcher).unwrap_err();
+
+        assert_eq!(
+            error,
+            VirtualMachineError::Execution(ExecutionError::BackendRejected)
+        );
+        assert_eq!(vm.state, VirtualMachineState::Failed);
+    }
+
+    #[test]
     fn created_vm_cannot_execute() {
         let node = node();
         let mut vm = VirtualMachine::from_node(&node, SystemTime::now()).unwrap();
