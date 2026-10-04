@@ -194,7 +194,12 @@ impl TcpEndpointServer {
         let request = read_request(&mut stream)?;
         let response = match self.endpoint.handle_request(request) {
             Ok(response) => response,
-            Err(error) => ExecutionResponse::failed("unknown", error.to_string()),
+            Err(error) => {
+                ExecutionResponse::failed(
+                    "unknown",
+                    format!("{error:?}"),
+                )
+            },
         };
         write_response(&mut stream, &response)
     }
@@ -536,6 +541,7 @@ pub enum TransportError {
     InvalidNodeIdentity,
     InvalidParticipantIdentity,
     InvalidRuntimeSpec,
+    InvalidResources,
     EndpointUnavailable,
     EndpointAlreadyRegistered,
     RequestRejected,
