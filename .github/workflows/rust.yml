@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   check:
-    name: Check (\${{ matrix.os }})
+    name: Check (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -21,14 +21,14 @@ jobs:
           - ubuntu-latest
           - macos-latest
           - windows-latest
-    runs-on: \${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: \${{ env.RUST_VERSION }}
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
       - name: Cache
         uses: Swatinem/rust-cache@v2
@@ -42,7 +42,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   build:
-    name: Build (\${{ matrix.os }})
+    name: Build (${{ matrix.os }})
     needs: check
     strategy:
       fail-fast: false
@@ -53,18 +53,18 @@ jobs:
             binary: openhost
           - os: macos-latest
             artifact: openhost-macos
-            binary: openhost
+            binary: openhost.exe
           - os: windows-latest
             artifact: openhost-windows-x86_64
             binary: openhost.exe
-    runs-on: \${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: \${{ env.RUST_VERSION }}
+          toolchain: ${{ env.RUST_VERSION }}
       - name: Cache
         uses: Swatinem/rust-cache@v2
       - name: Release build
@@ -73,9 +73,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/release/\${{ matrix.binary }}" "dist/\${{ matrix.binary }}"
+          cp "target/release/${{ matrix.binary }}" "dist/${{ matrix.binary }}"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: \${{ matrix.artifact }}
-          path: dist/\${{ matrix.binary }}
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.binary }}
