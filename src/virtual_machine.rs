@@ -2,6 +2,7 @@ use crate::execution::{
     ExecutionBackend, ExecutionError, ExecutionPlan, ExecutionReceipt, WorkItem,
 };
 use crate::identity::{Identity, Kind};
+use crate::lease::Lease;
 use crate::node::{LogicalNode, NodeError, RuntimeSpec};
 use crate::resource::ResourceFragment;
 use std::fmt;
@@ -42,6 +43,7 @@ pub struct VirtualMachine {
     pub id: Identity,
     pub node_id: Identity,
     pub spec: VirtualMachineSpec,
+    pub leases: Vec<Lease>,
     pub state: VirtualMachineState,
     pub created_at: SystemTime,
 }
@@ -56,6 +58,11 @@ pub enum VirtualMachineError {
     NodeMismatch,
     ResourceMismatch,
     RuntimeMismatch,
+    InvalidLease,
+    LeaseNodeMismatch,
+    LeaseParticipantMismatch,
+    LeaseResourceMismatch,
+    LeaseExpired,
     Execution(ExecutionError),
     NotRunning,
 }
@@ -68,9 +75,37 @@ impl fmt::Display for VirtualMachineError {
 
 impl std::error::Error for VirtualMachineError {}
 
+fn same_capacity(left: ResourceFragment, right: ResourceFragment) -> bool {
+    left.cpu == right.cpu
+        && left.memory == right.memory
+        && left.storage == right.storage
+        && left.network == right.network
+        && left.gpu == right.gpu
+}
+
 impl VirtualMachine {
     pub fn from_node(
         node: &LogicalNode,
+        created_at: SystemTime,
+    ) -> Result<Self, VirtualMachineError> {
+        Self::from_node_with_leases(node, Vec::new(), created_at)
+    }
+
+    pub fn from_leased_node(
+        node: &LogicalNode,
+        leases: Vec<Lease>,
+        created_at: SystemTime,
+    ) -> Result<Self, VirtualMachineError> {
+        if leases.is_empty() {
+            return Err(VirtualMachineError::InvalidLease);
+        }
+
+        Self::from_node_with_leases(node, leases, created_at)
+    }
+
+    fn from_node_with_leases(
+        node: &LogicalNode,
+        leases: Vec<Lease>,
         created_at: SystemTime,
     ) -> Result<Self, VirtualMachineError> {
         if created_at == SystemTime::UNIX_EPOCH {
@@ -87,10 +122,51 @@ impl VirtualMachine {
         let spec = VirtualMachineSpec::new(resources, node.runtime.clone());
         spec.validate()?;
 
+        if !leases.is_empty() {
+            if leases.len() != node.resources.allocations.len() {
+                return Err(VirtualMachineError::InvalidLease);
+            }
+
+            for lease in &leases {
+                lease
+                    .validate()
+                    .map_err(|_| VirtualMachineError::InvalidLease)?;
+
+                if lease.logical_node_id != node_id {
+                    return Err(VirtualMachineError::LeaseNodeMismatch);
+                }
+
+                if !lease.active_at(created_at) {
+                    return Err(VirtualMachineError::LeaseExpired);
+                }
+
+                let allocation = node
+                    .resources
+                    .allocations
+                    .iter()
+                    .find(|allocation| allocation.participant_id == lease.participant_id.id)
+                    .ok_or(VirtualMachineError::LeaseParticipantMismatch)?;
+
+                if !same_capacity(allocation.resources, lease.resources) {
+                    return Err(VirtualMachineError::LeaseResourceMismatch);
+                }
+            }
+
+            let unique_participants = leases
+                .iter()
+                .map(|lease| lease.participant_id.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+
+            if unique_participants.len() != leases.len() {
+                return Err(VirtualMachineError::InvalidLease);
+            }
+        }
+
         Ok(Self {
             id: Identity::new(Kind::VirtualMachine),
             node_id,
             spec,
+            leases,
             state: VirtualMachineState::Created,
             created_at,
         })
@@ -122,8 +198,22 @@ impl VirtualMachine {
         workload: &WorkItem,
         backend: &B,
     ) -> Result<ExecutionReceipt, VirtualMachineError> {
+        self.execute_at(node, workload, backend, SystemTime::now())
+    }
+
+    pub fn execute_at<B: ExecutionBackend>(
+        &mut self,
+        node: &LogicalNode,
+        workload: &WorkItem,
+        backend: &B,
+        now: SystemTime,
+    ) -> Result<ExecutionReceipt, VirtualMachineError> {
         if self.state != VirtualMachineState::Running {
             return Err(VirtualMachineError::NotRunning);
+        }
+
+        if self.leases.iter().any(|lease| !lease.active_at(now)) {
+            return Err(VirtualMachineError::LeaseExpired);
         }
 
         let plan = self.execution_plan(node, workload)?;
@@ -179,6 +269,88 @@ mod tests {
             resources,
             runtime: RuntimeSpec::new("wasm", "1"),
         }
+    }
+
+    #[test]
+    fn vm_binds_to_matching_leases() {
+        let node = node();
+        let created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let participant_id =
+            Identity::parse(&node.resources.allocations[0].participant_id, Kind::Participant)
+                .unwrap();
+        let node_id = Identity::parse(&node.id, Kind::LogicalNode).unwrap();
+        let lease = Lease::new(
+            Identity::new(Kind::Lease),
+            node_id,
+            participant_id,
+            node.resources.allocations[0].resources,
+            created_at,
+            created_at + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+        let vm = VirtualMachine::from_leased_node(&node, vec![lease], created_at).unwrap();
+
+        assert_eq!(vm.leases.len(), 1);
+        assert_eq!(vm.state, VirtualMachineState::Created);
+    }
+
+    #[test]
+    fn vm_rejects_lease_for_different_node() {
+        let node = node();
+        let created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let lease = Lease::new(
+            Identity::new(Kind::Lease),
+            Identity::new(Kind::LogicalNode),
+            Identity::parse(&node.resources.allocations[0].participant_id, Kind::Participant)
+                .unwrap(),
+            node.resources.allocations[0].resources,
+            created_at,
+            created_at + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+
+        assert_eq!(
+            VirtualMachine::from_leased_node(&node, vec![lease], created_at).unwrap_err(),
+            VirtualMachineError::LeaseNodeMismatch
+        );
+    }
+
+    #[test]
+    fn vm_rejects_expired_lease_at_execution_time() {
+        let node = node();
+        let created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let participant_id =
+            Identity::parse(&node.resources.allocations[0].participant_id, Kind::Participant)
+                .unwrap();
+        let node_id = Identity::parse(&node.id, Kind::LogicalNode).unwrap();
+        let lease = Lease::new(
+            Identity::new(Kind::Lease),
+            node_id,
+            participant_id,
+            node.resources.allocations[0].resources,
+            created_at,
+            created_at + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let mut vm = VirtualMachine::from_leased_node(&node, vec![lease], created_at).unwrap();
+        vm.start().unwrap();
+        let workload = WorkItem {
+            id: "work-lease-expired".into(),
+            payload: Vec::new(),
+        };
+
+        assert_eq!(
+            vm.execute_at(
+                &node,
+                &workload,
+                &crate::execution::NoopBackend,
+                created_at + std::time::Duration::from_secs(60),
+            )
+            .unwrap_err(),
+            VirtualMachineError::LeaseExpired
+        );
+        assert_eq!(vm.state, VirtualMachineState::Running);
     }
 
     #[test]
