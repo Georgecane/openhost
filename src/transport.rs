@@ -259,7 +259,7 @@ fn write_request(stream: &mut TcpStream, request: &ExecutionRequest) -> Result<(
     write_string(&mut payload, &request.runtime.name)?;
     write_string(&mut payload, &request.runtime.version)?;
     write_identity(&mut payload, &request.unit.participant_id)?;
-    write_resources(&mut payload, &request.unit.resources)?;
+    write_resources(&mut payload, request.unit.resources)?;
     write_identity(&mut payload, &request.endpoint.participant_id)?;
     write_string(&mut payload, &request.endpoint.locator)?;
     write_frame(stream, &payload)
