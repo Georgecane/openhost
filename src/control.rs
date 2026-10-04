@@ -40,18 +40,27 @@ pub struct Plane {
 #[cfg(test)]
 mod leased_vm_tests {
     use super::*;
-    use crate::discovery::MemoryRegistry as DiscoveryMemoryRegistry;
+    use crate::capability::{
+        Capability, ComputeCapability, Latency, Lifetime, MemoryCapability, NetworkCapability,
+        Reliability, Security, StorageCapability,
+    };
+    use crate::discovery::{FreshnessPolicy, MemoryRegistry as DiscoveryMemoryRegistry};
+    use crate::fabric::Fabric;
     use crate::participant::Participant;
-    use crate::capability::Capability;
     use crate::scheduler::AggregatingScheduler;
     use std::sync::Arc;
 
     fn plane() -> Plane {
-        let registry = Arc::new(Registry::default());
-        let discovery: Arc<dyn DiscoveryRegistry> =
-            Arc::new(DiscoveryMemoryRegistry::default());
-        let scheduler: Arc<dyn Scheduler> =
-            Arc::new(AggregatingScheduler::new(Arc::clone(&registry)));
+        let registry: Arc<Registry> = Arc::new(Registry::default());
+        let fabric: Arc<dyn Fabric> = registry.clone();
+        let discovery: Arc<dyn DiscoveryRegistry> = Arc::new(
+            DiscoveryMemoryRegistry::new(FreshnessPolicy {
+                stale_after: Duration::from_secs(60),
+                expire_after: Duration::from_secs(120),
+            })
+            .unwrap(),
+        );
+        let scheduler: Arc<dyn Scheduler> = Arc::new(AggregatingScheduler::new(fabric));
         Plane::new(registry, discovery, scheduler)
     }
 
@@ -59,7 +68,21 @@ mod leased_vm_tests {
         let participant = Arc::new(
             Participant::new(
                 Identity::new(Kind::Participant),
-                Capability::default(),
+                Capability {
+                    compute: ComputeCapability {
+                        cpu_cores: 2.0,
+                        gpu_units: 0,
+                    },
+                    memory: MemoryCapability { bytes: 0 },
+                    storage: StorageCapability { bytes: 0 },
+                    network: NetworkCapability { bits_per_second: 0 },
+                    reliability: Reliability { availability: 1.0 },
+                    latency: Latency {
+                        to_participant: Duration::from_millis(1),
+                    },
+                    lifetime: Lifetime { duration: None },
+                    security: Security { trusted: true },
+                },
                 ResourceFragment {
                     cpu: crate::resource::Cpu { cores: 2.0 },
                     ..Default::default()
@@ -68,7 +91,9 @@ mod leased_vm_tests {
             )
             .unwrap(),
         );
-        participant.activate().unwrap();
+        participant
+            .activate(SystemTime::UNIX_EPOCH + Duration::from_secs(2))
+            .unwrap();
         participant
     }
 
