@@ -37,123 +37,6 @@ pub struct Plane {
     leases: RwLock<BTreeMap<String, Lease>>,
 }
 
-#[cfg(test)]
-mod leased_vm_tests {
-    use super::*;
-    use crate::capability::{
-        Capability, ComputeCapability, Latency, Lifetime, MemoryCapability, NetworkCapability,
-        Reliability, Security, StorageCapability,
-    };
-    use crate::discovery::{FreshnessPolicy, MemoryRegistry as DiscoveryMemoryRegistry};
-    use crate::fabric::Fabric;
-    use crate::participant::Participant;
-    use crate::scheduler::AggregatingScheduler;
-    use std::sync::Arc;
-
-    fn plane() -> Plane {
-        let registry: Arc<Registry> = Arc::new(Registry::default());
-        let fabric: Arc<dyn Fabric> = registry.clone();
-        let discovery: Arc<dyn DiscoveryRegistry> = Arc::new(
-            DiscoveryMemoryRegistry::new(FreshnessPolicy {
-                stale_after: Duration::from_secs(60),
-                expire_after: Duration::from_secs(120),
-            })
-            .unwrap(),
-        );
-        let scheduler: Arc<dyn Scheduler> = Arc::new(AggregatingScheduler::new(fabric));
-        Plane::new(registry, discovery, scheduler)
-    }
-
-    fn active_participant() -> Arc<Participant> {
-        let participant = Arc::new(
-            Participant::new(
-                Identity::new(Kind::Participant),
-                Capability {
-                    compute: ComputeCapability {
-                        cpu_cores: 2.0,
-                        gpu_units: 0,
-                    },
-                    memory: MemoryCapability { bytes: 0 },
-                    storage: StorageCapability { bytes: 0 },
-                    network: NetworkCapability { bits_per_second: 0 },
-                    reliability: Reliability { availability: 1.0 },
-                    latency: Latency {
-                        to_participant: Duration::from_millis(1),
-                    },
-                    lifetime: Lifetime { duration: None },
-                    security: Security { trusted: true },
-                },
-                ResourceFragment {
-                    cpu: crate::resource::Cpu { cores: 2.0 },
-                    ..Default::default()
-                },
-                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-            )
-            .unwrap(),
-        );
-        participant
-            .activate(SystemTime::UNIX_EPOCH + Duration::from_secs(2))
-            .unwrap();
-        participant
-    }
-
-    #[test]
-    fn control_plane_creates_vm_from_owned_leases() {
-        let plane = plane();
-        let participant = active_participant();
-        plane.register_participant(Arc::clone(&participant)).unwrap();
-
-        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let (vm, leases) = plane
-            .create_leased_virtual_machine(
-                ResourceFragment {
-                    cpu: crate::resource::Cpu { cores: 1.0 },
-                    ..Default::default()
-                },
-                RuntimeSpec::new("wasm", "1"),
-                created_at,
-                Duration::from_secs(60),
-            )
-            .unwrap();
-
-        assert_eq!(vm.leases, leases);
-        assert_eq!(vm.node_id.kind, Kind::LogicalNode);
-        for lease in &leases {
-            assert_eq!(plane.get_lease(&lease.id).unwrap(), *lease);
-        }
-    }
-
-    #[test]
-    fn control_plane_releases_leases() {
-        let plane = plane();
-        let participant = active_participant();
-        plane.register_participant(participant).unwrap();
-
-        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let (_, leases) = plane
-            .create_leased_virtual_machine(
-                ResourceFragment {
-                    cpu: crate::resource::Cpu { cores: 1.0 },
-                    ..Default::default()
-                },
-                RuntimeSpec::new("wasm", "1"),
-                created_at,
-                Duration::from_secs(60),
-            )
-            .unwrap();
-
-        plane.release_leases(&leases).unwrap();
-
-        for lease in &leases {
-            assert_eq!(
-                plane.get_lease(&lease.id).unwrap_err(),
-                ControlError::LeaseNotFound
-            );
-        }
-    }
-}
-
-
 impl Plane {
     pub fn new(
         registry: Arc<Registry>,
@@ -370,5 +253,121 @@ impl Plane {
             .get(&id.id)
             .cloned()
             .ok_or(ControlError::LeaseNotFound)
+    }
+}
+
+#[cfg(test)]
+mod leased_vm_tests {
+    use super::*;
+    use crate::capability::{
+        Capability, ComputeCapability, Latency, Lifetime, MemoryCapability, NetworkCapability,
+        Reliability, Security, StorageCapability,
+    };
+    use crate::discovery::{FreshnessPolicy, MemoryRegistry as DiscoveryMemoryRegistry};
+    use crate::fabric::Fabric;
+    use crate::participant::Participant;
+    use crate::scheduler::AggregatingScheduler;
+    use std::sync::Arc;
+
+    fn plane() -> Plane {
+        let registry: Arc<Registry> = Arc::new(Registry::default());
+        let fabric: Arc<dyn Fabric> = registry.clone();
+        let discovery: Arc<dyn DiscoveryRegistry> = Arc::new(
+            DiscoveryMemoryRegistry::new(FreshnessPolicy {
+                stale_after: Duration::from_secs(60),
+                expire_after: Duration::from_secs(120),
+            })
+            .unwrap(),
+        );
+        let scheduler: Arc<dyn Scheduler> = Arc::new(AggregatingScheduler::new(fabric));
+        Plane::new(registry, discovery, scheduler)
+    }
+
+    fn active_participant() -> Arc<Participant> {
+        let participant = Arc::new(
+            Participant::new(
+                Identity::new(Kind::Participant),
+                Capability {
+                    compute: ComputeCapability {
+                        cpu_cores: 2.0,
+                        gpu_units: 0,
+                    },
+                    memory: MemoryCapability { bytes: 0 },
+                    storage: StorageCapability { bytes: 0 },
+                    network: NetworkCapability { bits_per_second: 0 },
+                    reliability: Reliability { availability: 1.0 },
+                    latency: Latency {
+                        to_participant: Duration::from_millis(1),
+                    },
+                    lifetime: Lifetime { duration: None },
+                    security: Security { trusted: true },
+                },
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 2.0 },
+                    ..Default::default()
+                },
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        participant
+            .activate(SystemTime::UNIX_EPOCH + Duration::from_secs(2))
+            .unwrap();
+        participant
+    }
+
+    #[test]
+    fn control_plane_creates_vm_from_owned_leases() {
+        let plane = plane();
+        let participant = active_participant();
+        plane.register_participant(Arc::clone(&participant)).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(vm.leases, leases);
+        assert_eq!(vm.node_id.kind, Kind::LogicalNode);
+        for lease in &leases {
+            assert_eq!(plane.get_lease(&lease.id).unwrap(), *lease);
+        }
+    }
+
+    #[test]
+    fn control_plane_releases_leases() {
+        let plane = plane();
+        let participant = active_participant();
+        plane.register_participant(participant).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (_, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        plane.release_leases(&leases).unwrap();
+
+        for lease in &leases {
+            assert_eq!(
+                plane.get_lease(&lease.id).unwrap_err(),
+                ControlError::LeaseNotFound
+            );
+        }
     }
 }
