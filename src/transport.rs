@@ -192,14 +192,10 @@ impl TcpEndpointServer {
             .accept()
             .map_err(|_| TransportError::NetworkFailure)?;
         let request = read_request(&mut stream)?;
+        let request_id = request.request_id.clone();
         let response = match self.endpoint.handle_request(request) {
             Ok(response) => response,
-            Err(error) => {
-                ExecutionResponse::failed(
-                    "unknown",
-                    format!("{error:?}"),
-                )
-            },
+            Err(error) => ExecutionResponse::failed(request_id, format!("{error:?}")),
         };
         write_response(&mut stream, &response)
     }
