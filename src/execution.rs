@@ -441,7 +441,7 @@ mod tests {
             crate::transport::ExecutionStatus::Failed,
             crate::transport::ExecutionStatus::Cancelled,
         ] {
-            let dispatcher = dispatcher_with_status(status);
+            let dispatcher = dispatcher_with_status(&plan_node, status);
             assert_eq!(
                 dispatcher.dispatch(&plan, &workload).unwrap_err(),
                 ExecutionError::BackendRejected
