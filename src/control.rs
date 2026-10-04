@@ -434,7 +434,7 @@ mod leased_vm_tests {
         let plane = plane();
         plane.register_participant(active_participant()).unwrap();
 
-        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let created_at = SystemTime::now();
         let (vm, leases) = plane
             .create_leased_virtual_machine(
                 ResourceFragment {
@@ -478,7 +478,7 @@ mod leased_vm_tests {
     fn control_plane_executes_workload_through_owned_vm() {
         let plane = plane();
         plane.register_participant(active_participant()).unwrap();
-        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let created_at = SystemTime::now();
         let (vm, _) = plane.create_leased_virtual_machine(
             ResourceFragment { cpu: crate::resource::Cpu { cores: 1.0 }, ..Default::default() },
             RuntimeSpec::new("wasm", "1"), created_at, Duration::from_secs(60),
@@ -499,7 +499,7 @@ mod leased_vm_tests {
         let participant_id = participant.snapshot().id;
         plane.register_participant(participant).unwrap();
 
-        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let created_at = SystemTime::now();
         let (vm, leases) = plane
             .create_leased_virtual_machine(
                 ResourceFragment {
@@ -559,7 +559,7 @@ mod leased_vm_tests {
         }
         let plane = plane();
         plane.register_participant(active_participant()).unwrap();
-        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let created_at = SystemTime::now();
         let (vm, _) = plane.create_leased_virtual_machine(
             ResourceFragment { cpu: crate::resource::Cpu { cores: 1.0 }, ..Default::default() },
             RuntimeSpec::new("wasm", "1"), created_at, Duration::from_secs(60),
