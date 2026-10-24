@@ -283,6 +283,25 @@ impl Plane {
             .map_err(ControlError::Execution)
     }
 
+    /// Dispatch with an explicit caller identity. Required for mTLS transports with
+    /// participant-to-certificate authorization enabled on remote endpoints.
+    pub fn dispatch_execution_plan_as<T: crate::transport::Transport>(
+        &self,
+        source_participant_id: Identity,
+        plan: &ExecutionPlan,
+        workload: &WorkItem,
+        endpoints: &[crate::transport::ExecutionEndpoint],
+        transport: T,
+    ) -> Result<crate::execution::DispatchReceipt, ControlError> {
+        crate::execution::ExecutionDispatcher::with_identity(
+            source_participant_id,
+            transport,
+            endpoints.to_vec(),
+        )
+        .dispatch(plan, workload)
+        .map_err(ControlError::Execution)
+    }
+
     pub fn create_leased_logical_node_with_runtime(
         &self,
         requirement: ResourceFragment,
