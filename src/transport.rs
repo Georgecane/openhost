@@ -220,19 +220,51 @@ impl TcpEndpointServer {
         Ok(())
     }
 
-    /// Run the endpoint server continuously, handling each connection on its own thread.
+    /// Run continuously with a bounded worker pool and bounded pending-connection queue.
     ///
-    /// This method runs until the listener fails. It does not provide graceful shutdown.
+    /// This method runs until the listener fails. It does not yet expose graceful shutdown.
     pub fn serve(&self) -> Result<(), TransportError> {
-        loop {
-            let (stream, _) = self
-                .listener
-                .accept()
-                .map_err(|_| TransportError::NetworkFailure)?;
+        let worker_count = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4)
+            .clamp(2, 32);
+        let queue_capacity = worker_count.saturating_mul(2).max(16);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<TcpStream>(queue_capacity);
+        let receiver = Arc::new(std::sync::Mutex::new(receiver));
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for _ in 0..worker_count {
+            let receiver = Arc::clone(&receiver);
             let endpoint = Arc::clone(&self.endpoint);
-            drop(std::thread::spawn(move || {
-                let _ = handle_connection(stream, endpoint);
+            workers.push(std::thread::spawn(move || loop {
+                let stream = {
+                    let Ok(receiver) = receiver.lock() else {
+                        return;
+                    };
+                    match receiver.recv() {
+                        Ok(stream) => stream,
+                        Err(_) => return,
+                    }
+                };
+                let _ = handle_connection(stream, Arc::clone(&endpoint));
             }));
+        }
+
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    if sender.send(stream).is_err() {
+                        return Err(TransportError::NetworkFailure);
+                    }
+                }
+                Err(_) => {
+                    drop(sender);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(TransportError::NetworkFailure);
+                }
+            }
         }
     }
 }
@@ -387,10 +419,10 @@ fn read_response(stream: &mut TcpStream) -> Result<ExecutionResponse, TransportE
     let mut reader = Reader::new(&payload);
     let request_id = reader.string()?;
     let status = u8_to_status(reader.byte()?)?;
-    let error = if reader.byte()? == 1 {
-        Some(reader.string()?)
-    } else {
-        None
+    let error = match reader.byte()? {
+        0 => None,
+        1 => Some(reader.string()?),
+        _ => return Err(TransportError::MalformedFrame),
     };
     reader.finish()?;
     Ok(ExecutionResponse {
@@ -876,6 +908,64 @@ mod tests {
         assert_eq!(second_response.request_id, "concurrent-2");
         assert_eq!(first_response.status, ExecutionStatus::Completed);
         assert_eq!(second_response.status, ExecutionStatus::Completed);
+    }
+
+    #[test]
+    fn tcp_transport_rejects_response_id_mismatch() {
+        struct MismatchedHandler {
+            participant_id: Identity,
+        }
+
+        impl crate::endpoint::ExecutionHandler for MismatchedHandler {
+            fn participant_id(&self) -> &Identity {
+                &self.participant_id
+            }
+
+            fn handle_request(
+                &self,
+                request: ExecutionRequest,
+            ) -> Result<ExecutionResponse, crate::endpoint::EndpointError> {
+                Ok(ExecutionResponse::completed(format!("{}-wrong", request.request_id)))
+            }
+        }
+
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(MismatchedHandler {
+            participant_id: participant_id.clone(),
+        });
+        let server = TcpEndpointServer::bind("127.0.0.1:0", endpoint).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || server.serve_once());
+
+        let mut request = request();
+        request.unit.participant_id = participant_id.clone();
+        request.endpoint =
+            ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+
+        assert_eq!(
+            TcpTransport::new().dispatch(request).unwrap_err(),
+            TransportError::ResponseIdMismatch
+        );
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn tcp_transport_rejects_invalid_response_error_flag() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut payload = Vec::new();
+            write_string(&mut payload, "request-1").unwrap();
+            payload.push(status_to_u8(ExecutionStatus::Completed));
+            payload.push(2);
+            write_frame(&mut stream, &payload).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        configure_stream(&stream).unwrap();
+        assert_eq!(read_response(&mut stream).unwrap_err(), TransportError::MalformedFrame);
+        server_thread.join().unwrap();
     }
 
     #[test]
