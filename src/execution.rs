@@ -442,6 +442,57 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_propagates_source_participant_identity() {
+        struct IdentityCheckingTransport(Identity);
+
+        impl crate::transport::Transport for IdentityCheckingTransport {
+            fn dispatch(
+                &self,
+                request: crate::transport::ExecutionRequest,
+            ) -> Result<
+                crate::transport::ExecutionResponse,
+                crate::transport::TransportError,
+            > {
+                assert_eq!(
+                    request.source_participant_id.as_ref(),
+                    Some(&self.0),
+                    "dispatcher did not attach its caller identity"
+                );
+                Ok(crate::transport::ExecutionResponse::completed(
+                    request.request_id,
+                ))
+            }
+        }
+
+        let workload = WorkItem {
+            id: "identity-propagation".into(),
+            payload: Vec::new(),
+        };
+        let plan_node = node();
+        let plan = ExecutionPlan::from_node(&plan_node, &workload).unwrap();
+        let endpoints = plan
+            .units
+            .iter()
+            .map(|unit| {
+                crate::transport::ExecutionEndpoint::new(
+                    unit.participant_id.clone(),
+                    "loopback://participant",
+                )
+                .unwrap()
+            })
+            .collect();
+        let caller = Identity::new(Kind::Participant);
+        let dispatcher = ExecutionDispatcher::with_identity(
+            caller.clone(),
+            IdentityCheckingTransport(caller),
+            endpoints,
+        );
+
+        let receipt = dispatcher.dispatch(&plan, &workload).unwrap();
+        assert_eq!(receipt.dispatched_units, plan.units.len());
+    }
+
+    #[test]
     fn dispatcher_accepts_non_terminal_execution_statuses() {
         let workload = WorkItem {
             id: "work-1".into(),
