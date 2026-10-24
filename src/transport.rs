@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -222,8 +223,34 @@ impl TcpEndpointServer {
 
     /// Run continuously with a bounded worker pool and bounded pending-connection queue.
     ///
-    /// This method runs until the listener fails. It does not yet expose graceful shutdown.
+    /// This method runs until the listener fails. Use `serve_until` when graceful shutdown
+    /// needs to be controlled by the caller.
     pub fn serve(&self) -> Result<(), TransportError> {
+        let shutdown = AtomicBool::new(false);
+        self.serve_until(&shutdown)
+    }
+
+    /// Serve until `shutdown` becomes true, then drain accepted connections and join workers.
+    ///
+    /// The listener is polled every 10 milliseconds so shutdown does not require a wake-up
+    /// connection. An execution handler that never returns can delay graceful shutdown.
+    pub fn serve_until(&self, shutdown: &AtomicBool) -> Result<(), TransportError> {
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|_| TransportError::NetworkFailure)?;
+
+        let result = self.run_until_shutdown(shutdown);
+        let restore_result = self
+            .listener
+            .set_nonblocking(false)
+            .map_err(|_| TransportError::NetworkFailure);
+
+        result.and(restore_result)
+    }
+
+    fn run_until_shutdown(&self, shutdown: &AtomicBool) -> Result<(), TransportError> {
+        const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
         let worker_count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4)
@@ -250,22 +277,35 @@ impl TcpEndpointServer {
             }));
         }
 
-        loop {
+        let accept_result = loop {
+            if shutdown.load(Ordering::Acquire) {
+                break Ok(());
+            }
+
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     if sender.send(stream).is_err() {
-                        return Err(TransportError::NetworkFailure);
+                        break Err(TransportError::NetworkFailure);
                     }
                 }
-                Err(_) => {
-                    drop(sender);
-                    for worker in workers {
-                        let _ = worker.join();
-                    }
-                    return Err(TransportError::NetworkFailure);
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ACCEPT_POLL_INTERVAL);
                 }
+                Err(_) => break Err(TransportError::NetworkFailure),
             }
+        };
+
+        drop(sender);
+        let mut worker_panicked = false;
+        for worker in workers {
+            worker_panicked |= worker.join().is_err();
         }
+
+        if worker_panicked {
+            return Err(TransportError::NetworkFailure);
+        }
+
+        accept_result
     }
 }
 
@@ -874,6 +914,46 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
+
+    #[test]
+    fn tcp_server_shuts_down_cleanly_and_restores_listener_mode() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let server = TcpEndpointServer::bind("127.0.0.1:0", endpoint).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_for_thread = server.clone();
+        let shutdown_for_thread = Arc::clone(&shutdown);
+
+        let server_thread = std::thread::spawn(move || {
+            server_for_thread.serve_until(&shutdown_for_thread)
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        shutdown.store(true, Ordering::Release);
+        server_thread.join().unwrap().unwrap();
+
+        // A subsequent blocking accept proves the listener mode was restored.
+        let address = server.local_addr().unwrap();
+        let server_for_request = server.clone();
+        let request_thread = std::thread::spawn(move || server_for_request.serve_once());
+        let mut request = request();
+        request.unit.participant_id = participant_id.clone();
+        request.endpoint =
+            ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+        let response = TcpTransport::new().dispatch(request).unwrap();
+
+        assert_eq!(response.status, ExecutionStatus::Completed);
+        request_thread.join().unwrap().unwrap();
+    }
 
     #[test]
     fn tcp_server_handles_concurrent_connections() {
