@@ -769,6 +769,78 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
+
+    #[test]
+    fn tcp_dispatcher_executes_plan_across_multiple_remote_endpoints() {
+        use crate::execution::{ExecutionDispatcher, ExecutionPlan};
+        use crate::node::LogicalNode;
+        use crate::resource::{Allocation, CompositeResource};
+
+        let participant_a = Identity::new(Kind::Participant);
+        let participant_b = Identity::new(Kind::Participant);
+        let endpoint_a = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_a.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let endpoint_b = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_b.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let server_a = TcpEndpointServer::bind("127.0.0.1:0", endpoint_a).unwrap();
+        let server_b = TcpEndpointServer::bind("127.0.0.1:0", endpoint_b).unwrap();
+        let address_a = server_a.local_addr().unwrap();
+        let address_b = server_b.local_addr().unwrap();
+
+        let server_thread_a = std::thread::spawn(move || server_a.serve_once());
+        let server_thread_b = std::thread::spawn(move || server_b.serve_once());
+
+        let node = LogicalNode {
+            id: Identity::new(Kind::LogicalNode).id,
+            resources: CompositeResource::compose(vec![
+                Allocation {
+                    participant_id: participant_a.id.clone(),
+                    resources: ResourceFragment {
+                        cpu: Cpu { cores: 1.0 },
+                        ..Default::default()
+                    },
+                },
+                Allocation {
+                    participant_id: participant_b.id.clone(),
+                    resources: ResourceFragment {
+                        cpu: Cpu { cores: 1.0 },
+                        ..Default::default()
+                    },
+                },
+            ])
+            .unwrap(),
+            runtime: RuntimeSpec::new("recording", "1"),
+        };
+        let workload = WorkItem {
+            id: "tcp-multi-participant".into(),
+            payload: vec![9, 8, 7],
+        };
+        let plan = ExecutionPlan::from_node(&node, &workload).unwrap();
+        let endpoints = vec![
+            ExecutionEndpoint::new(participant_a, address_a.to_string()).unwrap(),
+            ExecutionEndpoint::new(participant_b, address_b.to_string()).unwrap(),
+        ];
+        let dispatcher = ExecutionDispatcher::new(TcpTransport::new(), endpoints);
+
+        let receipt = dispatcher.dispatch(&plan, &workload).unwrap();
+
+        assert_eq!(receipt.workload_id, workload.id);
+        assert_eq!(receipt.node_id.id, node.id);
+        assert_eq!(receipt.dispatched_units, 2);
+        server_thread_a.join().unwrap().unwrap();
+        server_thread_b.join().unwrap().unwrap();
+    }
+
     #[test]
     fn tcp_transport_rejects_unreachable_endpoint() {
         let mut request = request();
