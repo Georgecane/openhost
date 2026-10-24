@@ -289,6 +289,7 @@ mod tests {
     fn request(participant_id: Identity) -> ExecutionRequest {
         ExecutionRequest {
             request_id: "request-1".into(),
+            source_participant_id: None,
             workload: WorkItem {
                 id: "work-1".into(),
                 payload: vec![1, 2, 3],
