@@ -125,7 +125,7 @@ let dispatcher = ExecutionDispatcher::with_identity(
 let receipt = dispatcher.dispatch(&plan, &workload)?;
 ```
 
-The endpoint locator must contain a hostname or IP address and port. That hostname or IP address must match the server certificate's subject alternative name. To rotate a certificate, configure multiple grants for the same participant ID during the transition, then remove the old grant after rollout.
+The endpoint locator must contain a hostname or IP address and port. That hostname or IP address must match the server certificate's subject alternative name. To rotate a certificate, configure multiple grants for the same participant ID during the transition, then remove the old grant after rollout. TCP payloads carry wire-protocol version 1; peers reject unknown versions instead of attempting to decode incompatible messages.
 
 **Certificate management remains the operator's responsibility.** Keep private keys out of source control and rotate/revoke certificates through your CA process. mTLS validates the certificate chain; the explicit grant additionally ensures a caller cannot claim a different participant ID using a certificate assigned to another identity. This implementation does not yet provide automated certificate issuance, revocation distribution, or a cluster-wide trust-policy control plane.
 
