@@ -96,13 +96,33 @@ impl DispatchReceipt {
 }
 
 pub struct ExecutionDispatcher<T> {
+    source_participant_id: Option<Identity>,
     transport: T,
     endpoints: Vec<crate::transport::ExecutionEndpoint>,
 }
 
 impl<T> ExecutionDispatcher<T> {
+    /// Create a dispatcher for transports that do not require caller identity, such as local
+    /// in-process execution or explicitly trusted plain TCP networks.
     pub fn new(transport: T, endpoints: Vec<crate::transport::ExecutionEndpoint>) -> Self {
         Self {
+            source_participant_id: None,
+            transport,
+            endpoints,
+        }
+    }
+
+    /// Create a dispatcher that identifies the participant issuing execution requests.
+    ///
+    /// TLS transports require this identity and the server must authorize its client certificate
+    /// for the declared identity.
+    pub fn with_identity(
+        source_participant_id: Identity,
+        transport: T,
+        endpoints: Vec<crate::transport::ExecutionEndpoint>,
+    ) -> Self {
+        Self {
+            source_participant_id: Some(source_participant_id),
             transport,
             endpoints,
         }
@@ -138,6 +158,7 @@ impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
 
                 Ok(crate::transport::ExecutionRequest {
                     request_id: format!("{}:{}", workload.id, unit.participant_id.id),
+                    source_participant_id: self.source_participant_id.clone(),
                     workload: workload.clone(),
                     node_id: plan.node_id.clone(),
                     runtime: plan.runtime.clone(),
