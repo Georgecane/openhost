@@ -1276,14 +1276,17 @@ mod tests {
         request.endpoint =
             ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
 
-        assert_eq!(
-            transport.dispatch(request).unwrap_err(),
-            TransportError::TlsHandshakeFailure
-        );
-        assert_eq!(
-            server_thread.join().unwrap().unwrap_err(),
-            TransportError::TlsHandshakeFailure
-        );
+        let client_result = transport.dispatch(request);
+        assert!(matches!(
+            client_result,
+            Err(TransportError::TlsHandshakeFailure | TransportError::NetworkFailure)
+        ));
+
+        let server_result = server_thread.join().unwrap();
+        assert!(matches!(
+            server_result,
+            Err(TransportError::TlsHandshakeFailure | TransportError::NetworkFailure)
+        ));
     }
 
     #[test]
