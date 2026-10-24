@@ -488,7 +488,7 @@ fn server_name_for_locator(locator: &str) -> Result<ServerName<'static>, Transpo
         return Err(TransportError::InvalidLocator);
     }
     if let Ok(address) = host.parse::<IpAddr>() {
-        return Ok(ServerName::IpAddress(address));
+        return Ok(ServerName::IpAddress(address.into()));
     }
     ServerName::try_from(host.to_owned()).map_err(|_| TransportError::TlsConfigurationFailure)
 }
