@@ -174,6 +174,8 @@ impl Transport for EndpointTransport {
 }
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+type ClientAllowlist = BTreeMap<String, Vec<Vec<u8>>>;
+type ClientAuthorization<'a> = Option<(&'a ClientAllowlist, Option<&'a [u8]>)>;
 
 /// A participant identity pinned to one or more exact client leaf certificates.
 #[derive(Debug, Clone)]
@@ -215,7 +217,7 @@ pub struct TcpEndpointServer {
     listener: Arc<TcpListener>,
     endpoint: Arc<dyn ExecutionHandler>,
     tls_config: Option<Arc<ServerConfig>>,
-    authorized_clients: Option<Arc<BTreeMap<String, Vec<Vec<u8>>>>>,
+    authorized_clients: Option<Arc<ClientAllowlist>>,
 }
 
 impl TcpEndpointServer {
@@ -258,7 +260,7 @@ impl TcpEndpointServer {
         locator: &str,
         endpoint: Arc<dyn ExecutionHandler>,
         tls_config: Option<Arc<ServerConfig>>,
-        authorized_clients: Option<Arc<BTreeMap<String, Vec<Vec<u8>>>>>,
+        authorized_clients: Option<Arc<ClientAllowlist>>,
     ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind(locator).map_err(|_| TransportError::NetworkFailure)?;
         Ok(Self {
@@ -413,7 +415,7 @@ fn handle_connection(
     mut socket: TcpStream,
     endpoint: Arc<dyn ExecutionHandler>,
     tls_config: Option<Arc<ServerConfig>>,
-    authorized_clients: Option<Arc<BTreeMap<String, Vec<Vec<u8>>>>>,
+    authorized_clients: Option<Arc<ClientAllowlist>>,
 ) -> Result<(), TransportError> {
     configure_stream(&socket)?;
     if let Some(config) = tls_config {
@@ -441,7 +443,7 @@ fn handle_connection(
 fn handle_request_stream<S: Read + Write>(
     stream: &mut S,
     endpoint: Arc<dyn ExecutionHandler>,
-    authorization: Option<(&BTreeMap<String, Vec<Vec<u8>>>, Option<&[u8]>)>,
+    authorization: Option<(&ClientAllowlist, Option<&[u8]>)>,
 ) -> Result<(), TransportError> {
     let request = read_request(stream)?;
 
@@ -472,7 +474,7 @@ fn handle_request_stream<S: Read + Write>(
 
 fn build_client_allowlist(
     authorized_clients: Vec<AuthorizedClientCertificate>,
-) -> Result<BTreeMap<String, Vec<Vec<u8>>>, TransportError> {
+) -> Result<ClientAllowlist, TransportError> {
     if authorized_clients.is_empty() {
         return Err(TransportError::EmptyClientAllowlist);
     }
@@ -679,10 +681,10 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
     if request.node_id.kind != Kind::LogicalNode {
         return Err(TransportError::InvalidNodeIdentity);
     }
-    if let Some(source) = &request.source_participant_id {
-        if source.kind != Kind::Participant || source.validate().is_err() {
-            return Err(TransportError::InvalidSourceIdentity);
-        }
+    if let Some(source) = &request.source_participant_id
+        && (source.kind != Kind::Participant || source.validate().is_err())
+    {
+        return Err(TransportError::InvalidSourceIdentity);
     }
     if request.runtime.name.is_empty() || request.runtime.version.is_empty() {
         return Err(TransportError::InvalidRuntimeSpec);
