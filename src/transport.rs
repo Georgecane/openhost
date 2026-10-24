@@ -1410,6 +1410,65 @@ mod tests {
     }
 
     #[test]
+    fn mtls_client_rejects_server_certificate_name_mismatch() {
+        let files = TlsTestFiles::new();
+        let wrong_server =
+            rcgen::generate_simple_self_signed(vec!["not-the-server.example".to_owned()])
+                .unwrap();
+        let wrong_server_certificate = files.directory.join("wrong-server-cert.pem");
+        let wrong_server_key = files.directory.join("wrong-server-key.pem");
+        std::fs::write(&wrong_server_certificate, wrong_server.cert.pem()).unwrap();
+        std::fs::write(&wrong_server_key, wrong_server.signing_key.serialize_pem()).unwrap();
+
+        let target_participant_id = Identity::new(Kind::Participant);
+        let source_participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                target_participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let grant = AuthorizedClientCertificate::from_pem(
+            source_participant_id.clone(),
+            &files.client_certificate,
+        )
+        .unwrap();
+        let server = TcpEndpointServer::bind_mtls(
+            "127.0.0.1:0",
+            endpoint,
+            &wrong_server_certificate,
+            &wrong_server_key,
+            &files.client_certificate,
+            vec![grant],
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || server.serve_once());
+
+        let transport = TlsTcpTransport::from_pem_files(
+            &wrong_server_certificate,
+            &files.client_certificate,
+            &files.client_key,
+        )
+        .unwrap();
+        let mut request = request();
+        request.source_participant_id = Some(source_participant_id);
+        request.unit.participant_id = target_participant_id.clone();
+        request.endpoint =
+            ExecutionEndpoint::new(target_participant_id, address.to_string()).unwrap();
+
+        assert!(matches!(
+            transport.dispatch(request),
+            Err(TransportError::TlsHandshakeFailure | TransportError::NetworkFailure)
+        ));
+        assert!(matches!(
+            server_thread.join().unwrap(),
+            Err(TransportError::TlsHandshakeFailure | TransportError::NetworkFailure)
+        ));
+    }
+
+    #[test]
     fn mtls_server_rejects_source_identity_not_bound_to_client_certificate() {
         let files = TlsTestFiles::new();
         let target_participant_id = Identity::new(Kind::Participant);
