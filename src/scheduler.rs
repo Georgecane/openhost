@@ -4,6 +4,7 @@ use crate::node::{LogicalNode, RuntimeSpec};
 use crate::resource::{
     Allocation, CompositeResource, Cpu, Gpu, Memory, Network, ResourceFragment, Storage,
 };
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -107,14 +108,22 @@ impl Scheduler for AggregatingScheduler {
         let mut offers: Vec<ResourceOffer> = self.fabric.offers();
         offers.sort_by(|a, b| a.participant_id.cmp(&b.participant_id));
 
+        let mut seen_participants = HashSet::with_capacity(offers.len());
+        for offer in &offers {
+            if offer.participant_id.is_empty()
+                || offer.resources.validate().is_err()
+                || !seen_participants.insert(offer.participant_id.clone())
+            {
+                // Validate the complete offer set before allocating, even if an early offer
+                // already satisfies the requirement.
+                return Err(SchedulerError::InvalidOffer);
+            }
+        }
+
         let mut total = ResourceFragment::default();
         let mut allocations = Vec::new();
 
         for offer in offers {
-            if offer.participant_id.is_empty() || offer.resources.validate().is_err() {
-                return Err(SchedulerError::InvalidOffer);
-            }
-
             let remaining = Self::remaining(requirement, total);
             let Some(share) = Self::allocation_share(offer.resources, remaining) else {
                 continue;
@@ -147,5 +156,81 @@ impl Scheduler for AggregatingScheduler {
             resources,
             runtime: RuntimeSpec::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fabric::ResourceOffer;
+
+    struct StaticFabric(Vec<ResourceOffer>);
+
+    impl Fabric for StaticFabric {
+        fn offers(&self) -> Vec<ResourceOffer> {
+            self.0.clone()
+        }
+    }
+
+    fn offer(participant_id: &str, cores: f64) -> ResourceOffer {
+        ResourceOffer {
+            participant_id: participant_id.to_owned(),
+            resources: ResourceFragment {
+                cpu: Cpu { cores },
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_participant_offers_instead_of_double_counting_resources() {
+        let fabric = Arc::new(StaticFabric(vec![
+            offer("participant-a", 1.0),
+            offer("participant-a", 1.0),
+        ]));
+        let scheduler = AggregatingScheduler::new(fabric);
+        let requirement = ResourceFragment {
+            cpu: Cpu { cores: 2.0 },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scheduler.plan(requirement).unwrap_err(),
+            SchedulerError::InvalidOffer
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_offers_even_when_first_offer_satisfies_requirement() {
+        let fabric = Arc::new(StaticFabric(vec![
+            offer("participant-a", 1.0),
+            offer("participant-a", 1.0),
+        ]));
+        let scheduler = AggregatingScheduler::new(fabric);
+        let requirement = ResourceFragment {
+            cpu: Cpu { cores: 1.0 },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scheduler.plan(requirement).unwrap_err(),
+            SchedulerError::InvalidOffer
+        );
+    }
+
+    #[test]
+    fn aggregates_distinct_participants_to_satisfy_requirement() {
+        let fabric = Arc::new(StaticFabric(vec![
+            offer("participant-a", 1.0),
+            offer("participant-b", 1.0),
+        ]));
+        let scheduler = AggregatingScheduler::new(fabric);
+        let requirement = ResourceFragment {
+            cpu: Cpu { cores: 2.0 },
+            ..Default::default()
+        };
+
+        let node = scheduler.plan(requirement).unwrap();
+        assert_eq!(node.resources.allocations.len(), 2);
     }
 }
