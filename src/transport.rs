@@ -704,9 +704,11 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
 }
 
 const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
+const PROTOCOL_VERSION: u8 = 1;
 
 fn write_request<S: Write>(stream: &mut S, request: &ExecutionRequest) -> Result<(), TransportError> {
     let mut payload = Vec::new();
+    payload.push(PROTOCOL_VERSION);
     write_string(&mut payload, &request.request_id)?;
     match &request.source_participant_id {
         Some(identity) => {
@@ -730,6 +732,10 @@ fn write_request<S: Write>(stream: &mut S, request: &ExecutionRequest) -> Result
 fn read_request<S: Read>(stream: &mut S) -> Result<ExecutionRequest, TransportError> {
     let payload = read_frame(stream)?;
     let mut reader = Reader::new(&payload);
+    let version = reader.byte()?;
+    if version != PROTOCOL_VERSION {
+        return Err(TransportError::UnsupportedProtocolVersion);
+    }
     let request_id = reader.string()?;
     let source_participant_id = match reader.byte()? {
         0 => None,
@@ -767,6 +773,7 @@ fn write_response<S: Write>(
     response: &ExecutionResponse,
 ) -> Result<(), TransportError> {
     let mut payload = Vec::new();
+    payload.push(PROTOCOL_VERSION);
     write_string(&mut payload, &response.request_id)?;
     payload.push(status_to_u8(response.status));
     match &response.error {
@@ -782,6 +789,10 @@ fn write_response<S: Write>(
 fn read_response<S: Read>(stream: &mut S) -> Result<ExecutionResponse, TransportError> {
     let payload = read_frame(stream)?;
     let mut reader = Reader::new(&payload);
+    let version = reader.byte()?;
+    if version != PROTOCOL_VERSION {
+        return Err(TransportError::UnsupportedProtocolVersion);
+    }
     let request_id = reader.string()?;
     let status = u8_to_status(reader.byte()?)?;
     let error = match reader.byte()? {
@@ -1019,6 +1030,7 @@ pub enum TransportError {
     EndpointAlreadyRegistered,
     RequestRejected,
     NetworkFailure,
+    UnsupportedProtocolVersion,
     TlsConfigurationFailure,
     TlsHandshakeFailure,
     ResponseIdMismatch,
@@ -1578,12 +1590,55 @@ mod tests {
     }
 
     #[test]
+    fn tcp_server_rejects_unsupported_request_protocol_version() {
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id,
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let server = TcpEndpointServer::bind("127.0.0.1:0", endpoint).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || server.serve_once());
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        configure_stream(&stream).unwrap();
+        write_frame(&mut stream, &[PROTOCOL_VERSION + 1]).unwrap();
+
+        assert_eq!(
+            server_thread.join().unwrap().unwrap_err(),
+            TransportError::UnsupportedProtocolVersion
+        );
+    }
+
+    #[test]
+    fn tcp_transport_rejects_unsupported_response_protocol_version() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            write_frame(&mut stream, &[PROTOCOL_VERSION + 1]).unwrap();
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        configure_stream(&stream).unwrap();
+        assert_eq!(
+            read_response(&mut stream).unwrap_err(),
+            TransportError::UnsupportedProtocolVersion
+        );
+        server_thread.join().unwrap();
+    }
+
+    #[test]
     fn tcp_transport_rejects_invalid_response_error_flag() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server_thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut payload = Vec::new();
+            payload.push(PROTOCOL_VERSION);
             write_string(&mut payload, "request-1").unwrap();
             payload.push(status_to_u8(ExecutionStatus::Completed));
             payload.push(2);
