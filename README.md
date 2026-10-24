@@ -80,19 +80,25 @@ OpenHost currently provides two TCP transports:
 - `TcpTransport` uses the custom framed protocol over plain TCP. Use it only on a trusted local network or for tests.
 - `TlsTcpTransport` encrypts traffic and authenticates the server and client using mutual TLS (mTLS).
 
-The mTLS server requires a server certificate chain and private key, plus a CA certificate bundle used to validate client certificates:
+The mTLS server requires a server certificate chain and private key, a CA bundle used to validate client certificates, and explicit participant-to-certificate grants. A grant binds a caller's participant ID to the exact client leaf certificate:
 
 ```rust
 use std::sync::Arc;
-use openhost::transport::{TcpEndpointServer, TlsTcpTransport};
+use openhost::transport::{AuthorizedClientCertificate, TcpEndpointServer};
 
-// `endpoint` implements ExecutionHandler.
+// `endpoint` implements ExecutionHandler and represents the target participant.
+let caller_id = Identity::parse(caller_uuid, Kind::Participant)?;
+let grant = AuthorizedClientCertificate::from_pem(
+    caller_id.clone(),
+    "certs/controller-client-cert.pem",
+)?;
 let server = TcpEndpointServer::bind_mtls(
     "0.0.0.0:7443",
     endpoint,
     "certs/server-chain.pem",
     "certs/server-key.pem",
     "certs/trusted-client-ca.pem",
+    vec![grant],
 )?;
 ```
 
@@ -103,14 +109,25 @@ use openhost::transport::TlsTcpTransport;
 
 let transport = TlsTcpTransport::from_pem_files(
     "certs/trusted-server-ca.pem",
-    "certs/client-chain.pem",
-    "certs/client-key.pem",
+    "certs/controller-client-chain.pem",
+    "certs/controller-client-key.pem",
 )?;
 ```
 
-Pass the resulting transport to the existing execution dispatcher in place of `TcpTransport`. The endpoint locator must contain a hostname or IP address and port. The hostname or IP address must match the server certificate's subject alternative name.
+For execution dispatch, supply the same caller identity used by the server's grant:
 
-**Certificate management is the operator's responsibility.** Keep private keys out of source control, rotate and revoke certificates through your CA process, and scope client CA bundles narrowly. This mTLS implementation validates certificate chains, but the transport protocol does not yet bind a TLS certificate to a declared source-participant identity. Do not treat possession of a CA-issued certificate as a complete application authorization policy. For untrusted networks, use only certificates from a dedicated trust domain and enforce network-level access controls until participant-to-certificate authorization is implemented.
+```rust
+let dispatcher = ExecutionDispatcher::with_identity(
+    caller_id,
+    transport,
+    execution_endpoints,
+);
+let receipt = dispatcher.dispatch(&plan, &workload)?;
+```
+
+The endpoint locator must contain a hostname or IP address and port. That hostname or IP address must match the server certificate's subject alternative name. To rotate a certificate, configure multiple grants for the same participant ID during the transition, then remove the old grant after rollout.
+
+**Certificate management remains the operator's responsibility.** Keep private keys out of source control and rotate/revoke certificates through your CA process. mTLS validates the certificate chain; the explicit grant additionally ensures a caller cannot claim a different participant ID using a certificate assigned to another identity. This implementation does not yet provide automated certificate issuance, revocation distribution, or a cluster-wide trust-policy control plane.
 
 ## Development
 
