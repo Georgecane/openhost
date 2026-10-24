@@ -865,6 +865,7 @@ pub enum TransportError {
     EmptyWorkloadId,
     InvalidEndpointIdentity,
     EmptyLocator,
+    InvalidLocator,
     InvalidNodeIdentity,
     InvalidParticipantIdentity,
     InvalidRuntimeSpec,
