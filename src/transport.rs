@@ -47,6 +47,8 @@ impl ExecutionEndpoint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionRequest {
     pub request_id: String,
+    /// Authenticated identity expected from the caller when using TLS.
+    pub source_participant_id: Option<Identity>,
     pub workload: WorkItem,
     pub node_id: Identity,
     pub runtime: RuntimeSpec,
@@ -173,11 +175,47 @@ impl Transport for EndpointTransport {
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A participant identity pinned to one or more exact client leaf certificates.
+#[derive(Debug, Clone)]
+pub struct AuthorizedClientCertificate {
+    participant_id: Identity,
+    certificate_der: Vec<u8>,
+}
+
+impl AuthorizedClientCertificate {
+    /// Load the first certificate in a PEM file and bind it to a participant identity.
+    ///
+    /// Multiple certificates may be supplied for the same identity to support rotation.
+    pub fn from_pem<P: AsRef<Path>>(
+        participant_id: Identity,
+        certificate_pem: P,
+    ) -> Result<Self, TransportError> {
+        if participant_id.kind != Kind::Participant || participant_id.validate().is_err() {
+            return Err(TransportError::InvalidSourceIdentity);
+        }
+
+        let certificate = load_certificates(certificate_pem.as_ref())?
+            .into_iter()
+            .next()
+            .ok_or(TransportError::TlsConfigurationFailure)?;
+
+        Ok(Self {
+            participant_id,
+            certificate_der: certificate.as_ref().to_vec(),
+        })
+    }
+
+    pub fn participant_id(&self) -> &Identity {
+        &self.participant_id
+    }
+}
+
 #[derive(Clone)]
 pub struct TcpEndpointServer {
     listener: Arc<TcpListener>,
     endpoint: Arc<dyn ExecutionHandler>,
     tls_config: Option<Arc<ServerConfig>>,
+    authorized_clients: Option<Arc<BTreeMap<String, Vec<Vec<u8>>>>>,
 }
 
 impl TcpEndpointServer {
@@ -186,38 +224,48 @@ impl TcpEndpointServer {
         locator: &str,
         endpoint: Arc<dyn ExecutionHandler>,
     ) -> Result<Self, TransportError> {
-        Self::bind_inner(locator, endpoint, None)
+        Self::bind_inner(locator, endpoint, None, None)
     }
 
-    /// Bind an endpoint using mutual TLS.
+    /// Bind an endpoint using mutual TLS and explicit participant-to-certificate authorization.
     ///
-    /// The server certificate and private key authenticate this server. The client CA file
-    /// is used to require and validate a certificate from each connecting participant.
+    /// In addition to validating the client's certificate chain, the server checks that the
+    /// request's source participant ID is mapped to the exact leaf certificate presented by
+    /// that client. Use a dedicated client CA for this endpoint's trust domain.
     pub fn bind_mtls<C: AsRef<Path>, K: AsRef<Path>, A: AsRef<Path>>(
         locator: &str,
         endpoint: Arc<dyn ExecutionHandler>,
         server_certificate_chain_pem: C,
         server_private_key_pem: K,
         trusted_client_ca_pem: A,
+        authorized_clients: Vec<AuthorizedClientCertificate>,
     ) -> Result<Self, TransportError> {
         let config = build_server_tls_config(
             server_certificate_chain_pem.as_ref(),
             server_private_key_pem.as_ref(),
             trusted_client_ca_pem.as_ref(),
         )?;
-        Self::bind_inner(locator, endpoint, Some(Arc::new(config)))
+        let allowed = build_client_allowlist(authorized_clients)?;
+        Self::bind_inner(
+            locator,
+            endpoint,
+            Some(Arc::new(config)),
+            Some(Arc::new(allowed)),
+        )
     }
 
     fn bind_inner(
         locator: &str,
         endpoint: Arc<dyn ExecutionHandler>,
         tls_config: Option<Arc<ServerConfig>>,
+        authorized_clients: Option<Arc<BTreeMap<String, Vec<Vec<u8>>>>>,
     ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind(locator).map_err(|_| TransportError::NetworkFailure)?;
         Ok(Self {
             listener: Arc::new(listener),
             endpoint,
             tls_config,
+            authorized_clients,
         })
     }
 
@@ -233,7 +281,12 @@ impl TcpEndpointServer {
             .listener
             .accept()
             .map_err(|_| TransportError::NetworkFailure)?;
-        handle_connection(stream, Arc::clone(&self.endpoint), self.tls_config.clone())
+        handle_connection(
+            stream,
+            Arc::clone(&self.endpoint),
+            self.tls_config.clone(),
+            self.authorized_clients.clone(),
+        )
     }
 
     /// Accept exactly the requested number of connections, handling them concurrently.
@@ -247,8 +300,9 @@ impl TcpEndpointServer {
                 .map_err(|_| TransportError::NetworkFailure)?;
             let endpoint = Arc::clone(&self.endpoint);
             let tls_config = self.tls_config.clone();
+            let authorized_clients = self.authorized_clients.clone();
             workers.push(std::thread::spawn(move || {
-                handle_connection(stream, endpoint, tls_config)
+                handle_connection(stream, endpoint, tls_config, authorized_clients)
             }));
         }
 
@@ -303,6 +357,7 @@ impl TcpEndpointServer {
             let receiver = Arc::clone(&receiver);
             let endpoint = Arc::clone(&self.endpoint);
             let tls_config = self.tls_config.clone();
+            let authorized_clients = self.authorized_clients.clone();
             workers.push(std::thread::spawn(move || loop {
                 let stream = {
                     let Ok(receiver) = receiver.lock() else {
@@ -313,7 +368,12 @@ impl TcpEndpointServer {
                         Err(_) => return,
                     }
                 };
-                let _ = handle_connection(stream, Arc::clone(&endpoint), tls_config.clone());
+                let _ = handle_connection(
+                    stream,
+                    Arc::clone(&endpoint),
+                    tls_config.clone(),
+                    authorized_clients.clone(),
+                );
             }));
         }
 
@@ -353,6 +413,7 @@ fn handle_connection(
     mut socket: TcpStream,
     endpoint: Arc<dyn ExecutionHandler>,
     tls_config: Option<Arc<ServerConfig>>,
+    authorized_clients: Option<Arc<BTreeMap<String, Vec<Vec<u8>>>>>,
 ) -> Result<(), TransportError> {
     configure_stream(&socket)?;
     if let Some(config) = tls_config {
@@ -363,24 +424,78 @@ fn handle_connection(
                 .complete_io(&mut socket)
                 .map_err(|_| TransportError::TlsHandshakeFailure)?;
         }
+        let peer_certificate = connection
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .map(|certificate| certificate.as_ref().to_vec());
         let mut stream = StreamOwned::new(connection, socket);
-        handle_request_stream(&mut stream, endpoint)
+        let authorization = authorized_clients
+            .as_deref()
+            .map(|allowed| (allowed, peer_certificate.as_deref()));
+        handle_request_stream(&mut stream, endpoint, authorization)
     } else {
-        handle_request_stream(&mut socket, endpoint)
+        handle_request_stream(&mut socket, endpoint, None)
     }
 }
 
 fn handle_request_stream<S: Read + Write>(
     stream: &mut S,
     endpoint: Arc<dyn ExecutionHandler>,
+    authorization: Option<(&BTreeMap<String, Vec<Vec<u8>>>, Option<&[u8]>)>,
 ) -> Result<(), TransportError> {
     let request = read_request(stream)?;
+
+    if let Some((allowed_clients, peer_certificate)) = authorization {
+        let source = request
+            .source_participant_id
+            .as_ref()
+            .ok_or(TransportError::MissingSourceIdentity)?;
+        let authorized_certificates = allowed_clients
+            .get(&source.id)
+            .ok_or(TransportError::UnauthorizedClient)?;
+        let peer_certificate = peer_certificate.ok_or(TransportError::UnauthorizedClient)?;
+        if !authorized_certificates
+            .iter()
+            .any(|certificate| certificate.as_slice() == peer_certificate)
+        {
+            return Err(TransportError::UnauthorizedClient);
+        }
+    }
+
     let request_id = request.request_id.clone();
     let response = match endpoint.handle_request(request) {
         Ok(response) => response,
         Err(error) => ExecutionResponse::failed(request_id, format!("{error:?}")),
     };
     write_response(stream, &response)
+}
+
+fn build_client_allowlist(
+    authorized_clients: Vec<AuthorizedClientCertificate>,
+) -> Result<BTreeMap<String, Vec<Vec<u8>>>, TransportError> {
+    if authorized_clients.is_empty() {
+        return Err(TransportError::EmptyClientAllowlist);
+    }
+
+    let mut allowlist = BTreeMap::<String, Vec<Vec<u8>>>::new();
+    let mut certificate_owners = BTreeMap::<Vec<u8>, String>::new();
+    for client in authorized_clients {
+        if let Some(owner) = certificate_owners.get(&client.certificate_der) {
+            if owner != &client.participant_id.id {
+                return Err(TransportError::CertificateAssignedToMultipleIdentities);
+            }
+            return Err(TransportError::DuplicateAuthorizedClientCertificate);
+        }
+        certificate_owners.insert(
+            client.certificate_der.clone(),
+            client.participant_id.id.clone(),
+        );
+        allowlist
+            .entry(client.participant_id.id)
+            .or_default()
+            .push(client.certificate_der);
+    }
+    Ok(allowlist)
 }
 
 fn configure_stream(stream: &TcpStream) -> Result<(), TransportError> {
@@ -447,6 +562,9 @@ impl TlsTcpTransport {
 impl Transport for TlsTcpTransport {
     fn dispatch(&self, request: ExecutionRequest) -> Result<ExecutionResponse, TransportError> {
         validate_transport_request(&request)?;
+        if request.source_participant_id.is_none() {
+            return Err(TransportError::MissingSourceIdentity);
+        }
         let server_name = server_name_for_locator(&request.endpoint.locator)?;
         let mut socket = connect_with_timeout(&request.endpoint.locator)?;
         configure_stream(&socket)?;
@@ -561,6 +679,11 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
     if request.node_id.kind != Kind::LogicalNode {
         return Err(TransportError::InvalidNodeIdentity);
     }
+    if let Some(source) = &request.source_participant_id {
+        if source.kind != Kind::Participant || source.validate().is_err() {
+            return Err(TransportError::InvalidSourceIdentity);
+        }
+    }
     if request.runtime.name.is_empty() || request.runtime.version.is_empty() {
         return Err(TransportError::InvalidRuntimeSpec);
     }
@@ -583,6 +706,13 @@ const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
 fn write_request<S: Write>(stream: &mut S, request: &ExecutionRequest) -> Result<(), TransportError> {
     let mut payload = Vec::new();
     write_string(&mut payload, &request.request_id)?;
+    match &request.source_participant_id {
+        Some(identity) => {
+            payload.push(1);
+            write_identity(&mut payload, identity)?;
+        }
+        None => payload.push(0),
+    }
     write_string(&mut payload, &request.workload.id)?;
     write_bytes(&mut payload, &request.workload.payload)?;
     write_identity(&mut payload, &request.node_id)?;
@@ -598,8 +728,15 @@ fn write_request<S: Write>(stream: &mut S, request: &ExecutionRequest) -> Result
 fn read_request<S: Read>(stream: &mut S) -> Result<ExecutionRequest, TransportError> {
     let payload = read_frame(stream)?;
     let mut reader = Reader::new(&payload);
+    let request_id = reader.string()?;
+    let source_participant_id = match reader.byte()? {
+        0 => None,
+        1 => Some(reader.identity()?),
+        _ => return Err(TransportError::MalformedFrame),
+    };
     let request = ExecutionRequest {
-        request_id: reader.string()?,
+        request_id,
+        source_participant_id,
         workload: WorkItem {
             id: reader.string()?,
             payload: reader.bytes()?,
@@ -866,6 +1003,12 @@ pub enum TransportError {
     InvalidEndpointIdentity,
     EmptyLocator,
     InvalidLocator,
+    InvalidSourceIdentity,
+    MissingSourceIdentity,
+    UnauthorizedClient,
+    EmptyClientAllowlist,
+    DuplicateAuthorizedClientCertificate,
+    CertificateAssignedToMultipleIdentities,
     InvalidNodeIdentity,
     InvalidParticipantIdentity,
     InvalidRuntimeSpec,
@@ -944,6 +1087,7 @@ mod tests {
         let participant_id = Identity::new(Kind::Participant);
         ExecutionRequest {
             request_id: "request-1".into(),
+            source_participant_id: None,
             workload: WorkItem {
                 id: "work-1".into(),
                 payload: vec![1, 2, 3],
@@ -1215,12 +1359,19 @@ mod tests {
             )
             .unwrap(),
         );
+        let source_participant_id = Identity::new(Kind::Participant);
+        let grant = AuthorizedClientCertificate::from_pem(
+            source_participant_id.clone(),
+            &files.client_certificate,
+        )
+        .unwrap();
         let server = TcpEndpointServer::bind_mtls(
             "127.0.0.1:0",
             endpoint,
             &files.server_certificate,
             &files.server_key,
             &files.client_certificate,
+            vec![grant],
         )
         .unwrap();
         let address = server.local_addr().unwrap();
@@ -1233,6 +1384,7 @@ mod tests {
         )
         .unwrap();
         let mut request = request();
+        request.source_participant_id = Some(source_participant_id);
         request.unit.participant_id = participant_id.clone();
         request.endpoint =
             ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
@@ -1241,6 +1393,58 @@ mod tests {
         assert_eq!(response.status, ExecutionStatus::Completed);
         assert!(response.error.is_none());
         server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn mtls_server_rejects_source_identity_not_bound_to_client_certificate() {
+        let files = TlsTestFiles::new();
+        let target_participant_id = Identity::new(Kind::Participant);
+        let authorized_source_id = Identity::new(Kind::Participant);
+        let spoofed_source_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                target_participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let grant = AuthorizedClientCertificate::from_pem(
+            authorized_source_id,
+            &files.client_certificate,
+        )
+        .unwrap();
+        let server = TcpEndpointServer::bind_mtls(
+            "127.0.0.1:0",
+            endpoint,
+            &files.server_certificate,
+            &files.server_key,
+            &files.client_certificate,
+            vec![grant],
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || server.serve_once());
+
+        let transport = TlsTcpTransport::from_pem_files(
+            &files.server_certificate,
+            &files.client_certificate,
+            &files.client_key,
+        )
+        .unwrap();
+        let mut request = request();
+        request.source_participant_id = Some(spoofed_source_id);
+        request.unit.participant_id = target_participant_id.clone();
+        request.endpoint =
+            ExecutionEndpoint::new(target_participant_id, address.to_string()).unwrap();
+
+        assert_eq!(
+            transport.dispatch(request).unwrap_err(),
+            TransportError::NetworkFailure
+        );
+        assert_eq!(
+            server_thread.join().unwrap().unwrap_err(),
+            TransportError::UnauthorizedClient
+        );
     }
 
     #[test]
@@ -1254,12 +1458,19 @@ mod tests {
             )
             .unwrap(),
         );
+        let source_participant_id = Identity::new(Kind::Participant);
+        let grant = AuthorizedClientCertificate::from_pem(
+            source_participant_id.clone(),
+            &files.client_certificate,
+        )
+        .unwrap();
         let server = TcpEndpointServer::bind_mtls(
             "127.0.0.1:0",
             endpoint,
             &files.server_certificate,
             &files.server_key,
             &files.client_certificate,
+            vec![grant],
         )
         .unwrap();
         let address = server.local_addr().unwrap();
@@ -1272,6 +1483,7 @@ mod tests {
         )
         .unwrap();
         let mut request = request();
+        request.source_participant_id = Some(source_participant_id);
         request.unit.participant_id = participant_id.clone();
         request.endpoint =
             ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
