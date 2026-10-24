@@ -443,7 +443,7 @@ fn handle_connection(
 fn handle_request_stream<S: Read + Write>(
     stream: &mut S,
     endpoint: Arc<dyn ExecutionHandler>,
-    authorization: Option<(&ClientAllowlist, Option<&[u8]>)>,
+    authorization: ClientAuthorization<'_>,
 ) -> Result<(), TransportError> {
     let request = read_request(stream)?;
 
