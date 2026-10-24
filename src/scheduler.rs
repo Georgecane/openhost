@@ -109,19 +109,21 @@ impl Scheduler for AggregatingScheduler {
         offers.sort_by(|a, b| a.participant_id.cmp(&b.participant_id));
 
         let mut seen_participants = HashSet::with_capacity(offers.len());
-        let mut total = ResourceFragment::default();
-        let mut allocations = Vec::new();
-
-        for offer in offers {
+        for offer in &offers {
             if offer.participant_id.is_empty()
                 || offer.resources.validate().is_err()
                 || !seen_participants.insert(offer.participant_id.clone())
             {
-                // A participant must contribute at most once to a plan. Counting duplicate
-                // advertisements would let one machine's resources be allocated repeatedly.
+                // Validate the complete offer set before allocating, even if an early offer
+                // already satisfies the requirement.
                 return Err(SchedulerError::InvalidOffer);
             }
+        }
 
+        let mut total = ResourceFragment::default();
+        let mut allocations = Vec::new();
+
+        for offer in offers {
             let remaining = Self::remaining(requirement, total);
             let Some(share) = Self::allocation_share(offer.resources, remaining) else {
                 continue;
@@ -189,6 +191,24 @@ mod tests {
         let scheduler = AggregatingScheduler::new(fabric);
         let requirement = ResourceFragment {
             cpu: Cpu { cores: 2.0 },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scheduler.plan(requirement).unwrap_err(),
+            SchedulerError::InvalidOffer
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_offers_even_when_first_offer_satisfies_requirement() {
+        let fabric = Arc::new(StaticFabric(vec![
+            offer("participant-a", 1.0),
+            offer("participant-a", 1.0),
+        ]));
+        let scheduler = AggregatingScheduler::new(fabric);
+        let requirement = ResourceFragment {
+            cpu: Cpu { cores: 1.0 },
             ..Default::default()
         };
 
