@@ -7,7 +7,12 @@ license = "GPL-3.0-only"
 description = "Distributed resource infrastructure where the network is the machine."
 
 [dependencies]
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2"
 uuid = { version = "1.18", features = ["v4"] }
+
+[dev-dependencies]
+rcgen = "0.14.10"
 
 [profile.release]
 lto = "thin"
