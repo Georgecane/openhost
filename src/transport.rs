@@ -6,8 +6,9 @@ use crate::resource::ResourceFragment;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionEndpoint {
@@ -163,6 +164,8 @@ impl Transport for EndpointTransport {
     }
 }
 
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct TcpEndpointServer {
     listener: Arc<TcpListener>,
@@ -187,19 +190,72 @@ impl TcpEndpointServer {
             .map_err(|_| TransportError::NetworkFailure)
     }
 
+    /// Accept and handle one connection. This is useful for simple embedding and tests.
     pub fn serve_once(&self) -> Result<(), TransportError> {
-        let (mut stream, _) = self
+        let (stream, _) = self
             .listener
             .accept()
             .map_err(|_| TransportError::NetworkFailure)?;
-        let request = read_request(&mut stream)?;
-        let request_id = request.request_id.clone();
-        let response = match self.endpoint.handle_request(request) {
-            Ok(response) => response,
-            Err(error) => ExecutionResponse::failed(request_id, format!("{error:?}")),
-        };
-        write_response(&mut stream, &response)
+        handle_connection(stream, Arc::clone(&self.endpoint))
     }
+
+    /// Accept exactly the requested number of connections, handling them concurrently.
+    /// Returns after all accepted connections have finished.
+    pub fn serve_n(&self, connection_count: usize) -> Result<(), TransportError> {
+        let mut workers = Vec::with_capacity(connection_count);
+        for _ in 0..connection_count {
+            let (stream, _) = self
+                .listener
+                .accept()
+                .map_err(|_| TransportError::NetworkFailure)?;
+            let endpoint = Arc::clone(&self.endpoint);
+            workers.push(std::thread::spawn(move || handle_connection(stream, endpoint)));
+        }
+
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| TransportError::NetworkFailure)??;
+        }
+        Ok(())
+    }
+
+    /// Run the endpoint server continuously, handling each connection on its own thread.
+    ///
+    /// This method runs until the listener fails. It does not provide graceful shutdown.
+    pub fn serve(&self) -> Result<(), TransportError> {
+        loop {
+            let (stream, _) = self
+                .listener
+                .accept()
+                .map_err(|_| TransportError::NetworkFailure)?;
+            let endpoint = Arc::clone(&self.endpoint);
+            drop(std::thread::spawn(move || {
+                let _ = handle_connection(stream, endpoint);
+            }));
+        }
+    }
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    endpoint: Arc<dyn ExecutionHandler>,
+) -> Result<(), TransportError> {
+    configure_stream(&stream)?;
+    let request = read_request(&mut stream)?;
+    let request_id = request.request_id.clone();
+    let response = match endpoint.handle_request(request) {
+        Ok(response) => response,
+        Err(error) => ExecutionResponse::failed(request_id, format!("{error:?}")),
+    };
+    write_response(&mut stream, &response)
+}
+
+fn configure_stream(stream: &TcpStream) -> Result<(), TransportError> {
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
+        .map_err(|_| TransportError::NetworkFailure)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -214,11 +270,27 @@ impl TcpTransport {
 impl Transport for TcpTransport {
     fn dispatch(&self, request: ExecutionRequest) -> Result<ExecutionResponse, TransportError> {
         validate_transport_request(&request)?;
-        let mut stream = TcpStream::connect(&request.endpoint.locator)
-            .map_err(|_| TransportError::NetworkFailure)?;
+        let mut stream = connect_with_timeout(&request.endpoint.locator)?;
+        configure_stream(&stream)?;
         write_request(&mut stream, &request)?;
-        read_response(&mut stream)
+        let response = read_response(&mut stream)?;
+        if response.request_id != request.request_id {
+            return Err(TransportError::ResponseIdMismatch);
+        }
+        Ok(response)
     }
+}
+
+fn connect_with_timeout(locator: &str) -> Result<TcpStream, TransportError> {
+    let addresses = locator
+        .to_socket_addrs()
+        .map_err(|_| TransportError::NetworkFailure)?;
+    for address in addresses {
+        if let Ok(stream) = TcpStream::connect_timeout(&address, IO_TIMEOUT) {
+            return Ok(stream);
+        }
+    }
+    Err(TransportError::NetworkFailure)
 }
 
 fn validate_transport_request(request: &ExecutionRequest) -> Result<(), TransportError> {
@@ -543,6 +615,7 @@ pub enum TransportError {
     EndpointAlreadyRegistered,
     RequestRejected,
     NetworkFailure,
+    ResponseIdMismatch,
     FrameTooLarge,
     MalformedFrame,
 }
@@ -769,6 +842,41 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
+
+    #[test]
+    fn tcp_server_handles_concurrent_connections() {
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let server = TcpEndpointServer::bind("127.0.0.1:0", endpoint).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || server.serve_n(2));
+
+        let mut first = request();
+        first.request_id = "concurrent-1".into();
+        first.unit.participant_id = participant_id.clone();
+        first.endpoint = ExecutionEndpoint::new(participant_id.clone(), address.to_string()).unwrap();
+
+        let mut second = first.clone();
+        second.request_id = "concurrent-2".into();
+
+        let first_thread = std::thread::spawn(move || TcpTransport::new().dispatch(first));
+        let second_thread = std::thread::spawn(move || TcpTransport::new().dispatch(second));
+
+        let first_response = first_thread.join().unwrap().unwrap();
+        let second_response = second_thread.join().unwrap().unwrap();
+        server_thread.join().unwrap().unwrap();
+
+        assert_eq!(first_response.request_id, "concurrent-1");
+        assert_eq!(second_response.request_id, "concurrent-2");
+        assert_eq!(first_response.status, ExecutionStatus::Completed);
+        assert_eq!(second_response.status, ExecutionStatus::Completed);
+    }
 
     #[test]
     fn tcp_dispatcher_executes_plan_across_multiple_remote_endpoints() {
