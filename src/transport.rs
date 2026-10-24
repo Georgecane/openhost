@@ -3,10 +3,16 @@ use crate::execution::{ExecutionUnit, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::node::RuntimeSpec;
 use crate::resource::ResourceFragment;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
+};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::fs::File;
+use std::io::{BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -171,17 +177,47 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct TcpEndpointServer {
     listener: Arc<TcpListener>,
     endpoint: Arc<dyn ExecutionHandler>,
+    tls_config: Option<Arc<ServerConfig>>,
 }
 
 impl TcpEndpointServer {
+    /// Bind an unencrypted TCP endpoint for trusted local networks or tests.
     pub fn bind(
         locator: &str,
         endpoint: Arc<dyn ExecutionHandler>,
+    ) -> Result<Self, TransportError> {
+        Self::bind_inner(locator, endpoint, None)
+    }
+
+    /// Bind an endpoint using mutual TLS.
+    ///
+    /// The server certificate and private key authenticate this server. The client CA file
+    /// is used to require and validate a certificate from each connecting participant.
+    pub fn bind_mtls<C: AsRef<Path>, K: AsRef<Path>, A: AsRef<Path>>(
+        locator: &str,
+        endpoint: Arc<dyn ExecutionHandler>,
+        server_certificate_chain_pem: C,
+        server_private_key_pem: K,
+        trusted_client_ca_pem: A,
+    ) -> Result<Self, TransportError> {
+        let config = build_server_tls_config(
+            server_certificate_chain_pem.as_ref(),
+            server_private_key_pem.as_ref(),
+            trusted_client_ca_pem.as_ref(),
+        )?;
+        Self::bind_inner(locator, endpoint, Some(Arc::new(config)))
+    }
+
+    fn bind_inner(
+        locator: &str,
+        endpoint: Arc<dyn ExecutionHandler>,
+        tls_config: Option<Arc<ServerConfig>>,
     ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind(locator).map_err(|_| TransportError::NetworkFailure)?;
         Ok(Self {
             listener: Arc::new(listener),
             endpoint,
+            tls_config,
         })
     }
 
@@ -197,7 +233,7 @@ impl TcpEndpointServer {
             .listener
             .accept()
             .map_err(|_| TransportError::NetworkFailure)?;
-        handle_connection(stream, Arc::clone(&self.endpoint))
+        handle_connection(stream, Arc::clone(&self.endpoint), self.tls_config.clone())
     }
 
     /// Accept exactly the requested number of connections, handling them concurrently.
@@ -210,7 +246,10 @@ impl TcpEndpointServer {
                 .accept()
                 .map_err(|_| TransportError::NetworkFailure)?;
             let endpoint = Arc::clone(&self.endpoint);
-            workers.push(std::thread::spawn(move || handle_connection(stream, endpoint)));
+            let tls_config = self.tls_config.clone();
+            workers.push(std::thread::spawn(move || {
+                handle_connection(stream, endpoint, tls_config)
+            }));
         }
 
         for worker in workers {
@@ -263,6 +302,7 @@ impl TcpEndpointServer {
         for _ in 0..worker_count {
             let receiver = Arc::clone(&receiver);
             let endpoint = Arc::clone(&self.endpoint);
+            let tls_config = self.tls_config.clone();
             workers.push(std::thread::spawn(move || loop {
                 let stream = {
                     let Ok(receiver) = receiver.lock() else {
@@ -273,7 +313,7 @@ impl TcpEndpointServer {
                         Err(_) => return,
                     }
                 };
-                let _ = handle_connection(stream, Arc::clone(&endpoint));
+                let _ = handle_connection(stream, Arc::clone(&endpoint), tls_config.clone());
             }));
         }
 
@@ -310,17 +350,37 @@ impl TcpEndpointServer {
 }
 
 fn handle_connection(
-    mut stream: TcpStream,
+    mut socket: TcpStream,
+    endpoint: Arc<dyn ExecutionHandler>,
+    tls_config: Option<Arc<ServerConfig>>,
+) -> Result<(), TransportError> {
+    configure_stream(&socket)?;
+    if let Some(config) = tls_config {
+        let mut connection =
+            ServerConnection::new(config).map_err(|_| TransportError::TlsConfigurationFailure)?;
+        while connection.is_handshaking() {
+            connection
+                .complete_io(&mut socket)
+                .map_err(|_| TransportError::TlsHandshakeFailure)?;
+        }
+        let mut stream = StreamOwned::new(connection, socket);
+        handle_request_stream(&mut stream, endpoint)
+    } else {
+        handle_request_stream(&mut socket, endpoint)
+    }
+}
+
+fn handle_request_stream<S: Read + Write>(
+    stream: &mut S,
     endpoint: Arc<dyn ExecutionHandler>,
 ) -> Result<(), TransportError> {
-    configure_stream(&stream)?;
-    let request = read_request(&mut stream)?;
+    let request = read_request(stream)?;
     let request_id = request.request_id.clone();
     let response = match endpoint.handle_request(request) {
         Ok(response) => response,
         Err(error) => ExecutionResponse::failed(request_id, format!("{error:?}")),
     };
-    write_response(&mut stream, &response)
+    write_response(stream, &response)
 }
 
 fn configure_stream(stream: &TcpStream) -> Result<(), TransportError> {
@@ -351,6 +411,132 @@ impl Transport for TcpTransport {
         }
         Ok(response)
     }
+}
+
+/// A client transport that encrypts requests and authenticates both peers with TLS.
+///
+/// Connections use the hostname or IP address from each endpoint locator for server-name
+/// verification. The client configuration must include a client certificate for mTLS.
+#[derive(Clone)]
+pub struct TlsTcpTransport {
+    config: Arc<ClientConfig>,
+}
+
+impl TlsTcpTransport {
+    pub fn new(config: Arc<ClientConfig>) -> Self {
+        Self { config }
+    }
+
+    /// Build an mTLS client from a trusted server CA, a client certificate chain, and its key.
+    pub fn from_pem_files<C: AsRef<Path>, K: AsRef<Path>, A: AsRef<Path>>(
+        trusted_server_ca_pem: A,
+        client_certificate_chain_pem: C,
+        client_private_key_pem: K,
+    ) -> Result<Self, TransportError> {
+        let roots = load_root_certificates(trusted_server_ca_pem.as_ref())?;
+        let certificates = load_certificates(client_certificate_chain_pem.as_ref())?;
+        let private_key = load_private_key(client_private_key_pem.as_ref())?;
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(certificates, private_key)
+            .map_err(|_| TransportError::TlsConfigurationFailure)?;
+        Ok(Self::new(Arc::new(config)))
+    }
+}
+
+impl Transport for TlsTcpTransport {
+    fn dispatch(&self, request: ExecutionRequest) -> Result<ExecutionResponse, TransportError> {
+        validate_transport_request(&request)?;
+        let server_name = server_name_for_locator(&request.endpoint.locator)?;
+        let mut socket = connect_with_timeout(&request.endpoint.locator)?;
+        configure_stream(&socket)?;
+
+        let mut connection = ClientConnection::new(Arc::clone(&self.config), server_name)
+            .map_err(|_| TransportError::TlsConfigurationFailure)?;
+        while connection.is_handshaking() {
+            connection
+                .complete_io(&mut socket)
+                .map_err(|_| TransportError::TlsHandshakeFailure)?;
+        }
+
+        let mut stream = StreamOwned::new(connection, socket);
+        write_request(&mut stream, &request)?;
+        let response = read_response(&mut stream)?;
+        if response.request_id != request.request_id {
+            return Err(TransportError::ResponseIdMismatch);
+        }
+        Ok(response)
+    }
+}
+
+fn server_name_for_locator(locator: &str) -> Result<ServerName<'static>, TransportError> {
+    if let Ok(address) = locator.parse::<SocketAddr>() {
+        return Ok(ServerName::IpAddress(address.ip().into()));
+    }
+
+    let (host, port) = locator
+        .rsplit_once(':')
+        .ok_or(TransportError::InvalidLocator)?;
+    if port.parse::<u16>().is_err() {
+        return Err(TransportError::InvalidLocator);
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.is_empty() {
+        return Err(TransportError::InvalidLocator);
+    }
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Ok(ServerName::IpAddress(address));
+    }
+    ServerName::try_from(host.to_owned()).map_err(|_| TransportError::TlsConfigurationFailure)
+}
+
+fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, TransportError> {
+    let file = File::open(path).map_err(|_| TransportError::TlsConfigurationFailure)?;
+    let mut reader = BufReader::new(file);
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| TransportError::TlsConfigurationFailure)?;
+    if certificates.is_empty() {
+        return Err(TransportError::TlsConfigurationFailure);
+    }
+    Ok(certificates)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TransportError> {
+    let file = File::open(path).map_err(|_| TransportError::TlsConfigurationFailure)?;
+    rustls_pemfile::private_key(&mut BufReader::new(file))
+        .map_err(|_| TransportError::TlsConfigurationFailure)?
+        .ok_or(TransportError::TlsConfigurationFailure)
+}
+
+fn load_root_certificates(path: &Path) -> Result<RootCertStore, TransportError> {
+    let mut roots = RootCertStore::empty();
+    for certificate in load_certificates(path)? {
+        roots
+            .add(certificate)
+            .map_err(|_| TransportError::TlsConfigurationFailure)?;
+    }
+    Ok(roots)
+}
+
+fn build_server_tls_config<C: AsRef<Path>, K: AsRef<Path>, A: AsRef<Path>>(
+    server_certificate_chain_pem: C,
+    server_private_key_pem: K,
+    trusted_client_ca_pem: A,
+) -> Result<ServerConfig, TransportError> {
+    let client_roots = load_root_certificates(trusted_client_ca_pem.as_ref())?;
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .build()
+        .map_err(|_| TransportError::TlsConfigurationFailure)?;
+    let certificates = load_certificates(server_certificate_chain_pem.as_ref())?;
+    let private_key = load_private_key(server_private_key_pem.as_ref())?;
+    ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(certificates, private_key)
+        .map_err(|_| TransportError::TlsConfigurationFailure)
 }
 
 fn connect_with_timeout(locator: &str) -> Result<TcpStream, TransportError> {
@@ -394,7 +580,7 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
 
 const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
 
-fn write_request(stream: &mut TcpStream, request: &ExecutionRequest) -> Result<(), TransportError> {
+fn write_request<S: Write>(stream: &mut S, request: &ExecutionRequest) -> Result<(), TransportError> {
     let mut payload = Vec::new();
     write_string(&mut payload, &request.request_id)?;
     write_string(&mut payload, &request.workload.id)?;
@@ -409,7 +595,7 @@ fn write_request(stream: &mut TcpStream, request: &ExecutionRequest) -> Result<(
     write_frame(stream, &payload)
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<ExecutionRequest, TransportError> {
+fn read_request<S: Read>(stream: &mut S) -> Result<ExecutionRequest, TransportError> {
     let payload = read_frame(stream)?;
     let mut reader = Reader::new(&payload);
     let request = ExecutionRequest {
@@ -437,8 +623,8 @@ fn read_request(stream: &mut TcpStream) -> Result<ExecutionRequest, TransportErr
     Ok(request)
 }
 
-fn write_response(
-    stream: &mut TcpStream,
+fn write_response<S: Write>(
+    stream: &mut S,
     response: &ExecutionResponse,
 ) -> Result<(), TransportError> {
     let mut payload = Vec::new();
@@ -454,7 +640,7 @@ fn write_response(
     write_frame(stream, &payload)
 }
 
-fn read_response(stream: &mut TcpStream) -> Result<ExecutionResponse, TransportError> {
+fn read_response<S: Read>(stream: &mut S) -> Result<ExecutionResponse, TransportError> {
     let payload = read_frame(stream)?;
     let mut reader = Reader::new(&payload);
     let request_id = reader.string()?;
@@ -472,7 +658,7 @@ fn read_response(stream: &mut TcpStream) -> Result<ExecutionResponse, TransportE
     })
 }
 
-fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), TransportError> {
+fn write_frame<S: Write>(stream: &mut S, payload: &[u8]) -> Result<(), TransportError> {
     if payload.len() as u64 > MAX_FRAME_SIZE {
         return Err(TransportError::FrameTooLarge);
     }
@@ -482,7 +668,7 @@ fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), TransportEr
         .map_err(|_| TransportError::NetworkFailure)
 }
 
-fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, TransportError> {
+fn read_frame<S: Read>(stream: &mut S) -> Result<Vec<u8>, TransportError> {
     let mut header = [0_u8; 8];
     stream
         .read_exact(&mut header)
@@ -687,6 +873,8 @@ pub enum TransportError {
     EndpointAlreadyRegistered,
     RequestRejected,
     NetworkFailure,
+    TlsConfigurationFailure,
+    TlsHandshakeFailure,
     ResponseIdMismatch,
     FrameTooLarge,
     MalformedFrame,
@@ -953,6 +1141,148 @@ mod tests {
 
         assert_eq!(response.status, ExecutionStatus::Completed);
         request_thread.join().unwrap().unwrap();
+    }
+
+    struct TlsTestFiles {
+        directory: std::path::PathBuf,
+        server_certificate: std::path::PathBuf,
+        server_key: std::path::PathBuf,
+        client_certificate: std::path::PathBuf,
+        client_key: std::path::PathBuf,
+        untrusted_client_certificate: std::path::PathBuf,
+        untrusted_client_key: std::path::PathBuf,
+    }
+
+    impl TlsTestFiles {
+        fn new() -> Self {
+            use std::fs;
+            let directory =
+                std::env::temp_dir().join(format!("openhost-tls-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&directory).unwrap();
+
+            let server = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+                .unwrap();
+            let client =
+                rcgen::generate_simple_self_signed(vec!["openhost-client".to_owned()]).unwrap();
+            let untrusted_client =
+                rcgen::generate_simple_self_signed(vec!["untrusted-client".to_owned()]).unwrap();
+
+            let server_certificate = directory.join("server-cert.pem");
+            let server_key = directory.join("server-key.pem");
+            let client_certificate = directory.join("client-cert.pem");
+            let client_key = directory.join("client-key.pem");
+            let untrusted_client_certificate = directory.join("untrusted-client-cert.pem");
+            let untrusted_client_key = directory.join("untrusted-client-key.pem");
+
+            fs::write(&server_certificate, server.cert.pem()).unwrap();
+            fs::write(&server_key, server.signing_key.serialize_pem()).unwrap();
+            fs::write(&client_certificate, client.cert.pem()).unwrap();
+            fs::write(&client_key, client.signing_key.serialize_pem()).unwrap();
+            fs::write(&untrusted_client_certificate, untrusted_client.cert.pem()).unwrap();
+            fs::write(
+                &untrusted_client_key,
+                untrusted_client.signing_key.serialize_pem(),
+            )
+            .unwrap();
+
+            Self {
+                directory,
+                server_certificate,
+                server_key,
+                client_certificate,
+                client_key,
+                untrusted_client_certificate,
+                untrusted_client_key,
+            }
+        }
+    }
+
+    impl Drop for TlsTestFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn mtls_transport_executes_over_authenticated_tls() {
+        let files = TlsTestFiles::new();
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let server = TcpEndpointServer::bind_mtls(
+            "127.0.0.1:0",
+            endpoint,
+            &files.server_certificate,
+            &files.server_key,
+            &files.client_certificate,
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || server.serve_once());
+
+        let transport = TlsTcpTransport::from_pem_files(
+            &files.server_certificate,
+            &files.client_certificate,
+            &files.client_key,
+        )
+        .unwrap();
+        let mut request = request();
+        request.unit.participant_id = participant_id.clone();
+        request.endpoint =
+            ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+
+        let response = transport.dispatch(request).unwrap();
+        assert_eq!(response.status, ExecutionStatus::Completed);
+        assert!(response.error.is_none());
+        server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn mtls_server_rejects_untrusted_client_certificate() {
+        let files = TlsTestFiles::new();
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint = Arc::new(
+            crate::endpoint::ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                crate::endpoint::NoopParticipantExecutor,
+            )
+            .unwrap(),
+        );
+        let server = TcpEndpointServer::bind_mtls(
+            "127.0.0.1:0",
+            endpoint,
+            &files.server_certificate,
+            &files.server_key,
+            &files.client_certificate,
+        )
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || server.serve_once());
+
+        let transport = TlsTcpTransport::from_pem_files(
+            &files.server_certificate,
+            &files.untrusted_client_certificate,
+            &files.untrusted_client_key,
+        )
+        .unwrap();
+        let mut request = request();
+        request.unit.participant_id = participant_id.clone();
+        request.endpoint =
+            ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+
+        assert_eq!(
+            transport.dispatch(request).unwrap_err(),
+            TransportError::TlsHandshakeFailure
+        );
+        assert_eq!(
+            server_thread.join().unwrap().unwrap_err(),
+            TransportError::TlsHandshakeFailure
+        );
     }
 
     #[test]
