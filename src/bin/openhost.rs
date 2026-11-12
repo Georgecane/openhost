@@ -37,6 +37,8 @@ fn print_help() {
     println!("      --cpu <cores>          Offered CPU cores (default: 2.0)");
     println!("      --memory-mb <mb>       Offered memory in MB (default: 1024)");
     println!("      --beacon <addr:port>   Optional UDP broadcast address for discovery");
+    println!("      --allow-program <path> Explicitly allow a local process runtime command (loopback only)");
+    println!("      --process-timeout <s>  Process execution timeout in seconds (default: 10)");
     println!("  discover [options]         Listen for UDP peer discovery beacons");
     println!("      --bind <addr:port>     UDP listen address (default: 0.0.0.0:7444)");
     println!("      --duration <secs>      Optional listening duration in seconds");
@@ -203,6 +205,8 @@ fn run_participant(args: &[String]) {
     let mut cpu_cores = 2.0;
     let mut memory_mb = 1024u64;
     let mut beacon_target: Option<String> = None;
+    let mut allowed_programs = Vec::new();
+    let mut process_timeout_secs = 10u64;
 
     let mut i = 0;
     while i < args.len() {
@@ -221,6 +225,14 @@ fn run_participant(args: &[String]) {
             }
             "--beacon" if i + 1 < args.len() => {
                 beacon_target = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--allow-program" if i + 1 < args.len() => {
+                allowed_programs.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--process-timeout" if i + 1 < args.len() => {
+                process_timeout_secs = args[i + 1].parse().unwrap_or(10);
                 i += 2;
             }
             _ => {
@@ -243,12 +255,30 @@ fn run_participant(args: &[String]) {
             Arc::new(EchoRuntime::new("echo")),
         )
         .expect("register echo runtime");
-    registry
-        .register(
-            RuntimeSpec::new("process", "1"),
-            Arc::new(ProcessRuntime::new("process")),
-        )
-        .expect("register process runtime");
+    if !allowed_programs.is_empty() {
+        let loopback_only = bind_addr
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|address| address.ip().is_loopback());
+
+        if loopback_only {
+            registry
+                .register(
+                    RuntimeSpec::new("process", "1"),
+                    Arc::new(
+                        ProcessRuntime::with_allowlist("process", allowed_programs)
+                            .with_timeout(Duration::from_secs(process_timeout_secs.max(1))),
+                    ),
+                )
+                .expect("register allowlisted process runtime");
+            println!("Process runtime enabled with an explicit allowlist and timeout.");
+        } else {
+            eprintln!(
+                "Process runtime disabled: this CLI participant uses unauthenticated TCP;                  process execution is only enabled when bound to a loopback address."
+            );
+        }
+    } else {
+        println!("Process runtime disabled by default. Use --allow-program on loopback to opt in.");
+    }
 
     let adapter = RegistryRuntimeAdapter::new(Arc::new(registry));
     let endpoint = Arc::new(
@@ -360,7 +390,13 @@ fn run_exec(args: &[String]) {
 
     let payload = if runtime_name == "process" {
         let prog = program.unwrap_or_else(|| "echo".to_string());
-        ProcessCommand::new(prog).args(prog_args).encode()
+        match ProcessCommand::new(prog).args(prog_args).encode() {
+            Ok(payload) => payload,
+            Err(error) => {
+                eprintln!("Invalid process command: {:?}", error);
+                return;
+            }
+        }
     } else {
         b"OpenHost Ping".to_vec()
     };
