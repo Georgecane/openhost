@@ -24,6 +24,7 @@ pub enum ControlError {
     ParticipantNotFound,
     ParticipantNotAllocated,
     LogicalNodeNotFound,
+    ConcurrentModification,
     Scheduler(SchedulerError),
     Node(NodeError),
     Execution(ExecutionError),
@@ -261,6 +262,10 @@ impl Plane {
         id: &Identity,
         now: SystemTime,
     ) -> Result<Vec<Identity>, ControlError> {
+        if now == SystemTime::UNIX_EPOCH {
+            return Err(ControlError::InvalidTime);
+        }
+
         let vm = self.get_virtual_machine(id)?;
         let mut unhealthy = Vec::new();
 
@@ -270,18 +275,18 @@ impl Plane {
                 continue;
             }
 
-            if let Ok(participant) = self.registry.get(&lease.participant_id) {
-                let snapshot = participant.snapshot();
-                if snapshot.state != crate::participant::State::Active {
+            match self.registry.get(&lease.participant_id) {
+                Ok(participant) => {
+                    if participant.snapshot().state != crate::participant::State::Active {
+                        unhealthy.push(lease.participant_id.clone());
+                    }
+                }
+                Err(_) => {
+                    // Discovery advertisements are currently unsigned hints. A missing local
+                    // participant cannot be considered healthy based on an unauthenticated UDP
+                    // advertisement, so fail closed until authenticated liveness is available.
                     unhealthy.push(lease.participant_id.clone());
                 }
-            } else if let Ok(members) = self.discovery.members_at(now)
-                && members.iter().any(|(m, state)| {
-                    m.advertisement.participant == lease.participant_id
-                        && *state == crate::discovery::State::Expired
-                })
-            {
-                unhealthy.push(lease.participant_id.clone());
             }
         }
 
@@ -301,102 +306,143 @@ impl Plane {
         if lease_duration.is_zero() {
             return Err(ControlError::InvalidLeaseDuration);
         }
+        if failed_participant_id.kind != Kind::Participant
+            || failed_participant_id.validate().is_err()
+        {
+            return Err(ControlError::ParticipantNotAllocated);
+        }
 
-        let mut vm = self.get_virtual_machine(vm_id)?;
-        let mut node = self
+        // Build a complete replacement off to the side. No live lease or registry entry is
+        // mutated until all validation and composition has succeeded.
+        let vm_snapshot = self.get_virtual_machine(vm_id)?;
+        let node_snapshot = self
             .logical_nodes
             .read()
             .expect("logical node registry lock poisoned")
-            .get(&vm.node_id.id)
+            .get(&vm_snapshot.node_id.id)
             .cloned()
             .ok_or(ControlError::VirtualMachineNotFound)?;
 
-        let alloc_idx = node
+        let allocation_index = node_snapshot
             .resources
             .allocations
             .iter()
-            .position(|a| a.participant_id == failed_participant_id.id)
+            .position(|allocation| allocation.participant_id == failed_participant_id.id)
             .ok_or(ControlError::ParticipantNotAllocated)?;
+        let old_lease_index = vm_snapshot
+            .leases
+            .iter()
+            .position(|lease| lease.participant_id == *failed_participant_id)
+            .ok_or(ControlError::LeaseNotFound)?;
+        let old_lease = vm_snapshot.leases[old_lease_index].clone();
+        if self.get_lease(&old_lease.id)? != old_lease {
+            return Err(ControlError::ConcurrentModification);
+        }
 
-        let needed_resources = node.resources.allocations[alloc_idx].resources;
-
-        let existing_participants: std::collections::HashSet<_> = node
+        let needed_resources = node_snapshot.resources.allocations[allocation_index].resources;
+        let existing_participants: std::collections::HashSet<_> = node_snapshot
             .resources
             .allocations
             .iter()
-            .map(|a| a.participant_id.clone())
+            .map(|allocation| allocation.participant_id.clone())
             .collect();
 
-        let offers = self.registry.offers();
-        let replacement_offer = offers
+        let replacement_offer = self
+            .registry
+            .offers()
             .into_iter()
+            .filter(|offer| !existing_participants.contains(&offer.participant_id))
             .find(|offer| {
-                !existing_participants.contains(&offer.participant_id)
+                offer.resources.validate_requirement().is_ok()
                     && offer.resources.satisfies(&needed_resources)
+                    && Identity::parse(&offer.participant_id, Kind::Participant).is_ok()
             })
             .ok_or(ControlError::Scheduler(
                 SchedulerError::InsufficientResources,
             ))?;
-
         let replacement_participant_id =
             Identity::parse(&replacement_offer.participant_id, Kind::Participant)
                 .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
 
-        if let Some(old_lease_idx) = vm
-            .leases
-            .iter()
-            .position(|l| l.participant_id == *failed_participant_id)
-        {
-            let old_lease = vm.leases.remove(old_lease_idx);
-            let _ = self.release_lease(&old_lease.id);
+        // Preserve the allocation's resource snapshot (including its lifetime) so the
+        // recomposed node remains exactly compatible with the VM specification. The lease
+        // duration is capped by that snapshot rather than changing the allocation itself.
+        let resources = needed_resources;
+        let effective_duration = resources
+            .lifetime
+            .map_or(lease_duration, |maximum| lease_duration.min(maximum));
+        if effective_duration.is_zero() {
+            return Err(ControlError::InvalidLeaseDuration);
         }
-
-        let mut resources = needed_resources;
-        if resources.lifetime.is_none_or(|l| l > lease_duration) {
-            resources.lifetime = Some(lease_duration);
-        }
-
+        let expires_at = now
+            .checked_add(effective_duration)
+            .ok_or(ControlError::InvalidTime)?;
         let new_lease = Lease::new(
             Identity::new(Kind::Lease),
-            vm.node_id.clone(),
+            vm_snapshot.node_id.clone(),
             replacement_participant_id.clone(),
             resources,
             now,
-            now + lease_duration,
+            expires_at,
         )
-        .map_err(|_| ControlError::Scheduler(SchedulerError::InsufficientResources))?;
+        .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
 
-        self.leases
-            .write()
-            .expect("lease registry lock poisoned")
-            .insert(new_lease.id.id.clone(), new_lease.clone());
-
-        node.resources.allocations[alloc_idx] = crate::resource::Allocation {
-            participant_id: replacement_participant_id.id.clone(),
-            resources,
-        };
-
-        let new_resources =
-            crate::resource::CompositeResource::compose(node.resources.allocations.clone())
-                .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
-        node.resources = new_resources;
-
-        vm.leases.push(new_lease.clone());
-        if vm.state == crate::virtual_machine::VirtualMachineState::Failed {
-            vm.state = crate::virtual_machine::VirtualMachineState::Running;
+        let mut replacement_node = node_snapshot.clone();
+        replacement_node.resources.allocations[allocation_index] =
+            crate::resource::Allocation {
+                participant_id: replacement_participant_id.id.clone(),
+                resources,
+            };
+        replacement_node.resources =
+            crate::resource::CompositeResource::compose(
+                replacement_node.resources.allocations.clone(),
+            )
+            .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
+        replacement_node
+            .resources
+            .validate()
+            .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
+        if replacement_node.resources.capacity != node_snapshot.resources.capacity {
+            return Err(ControlError::Scheduler(SchedulerError::InvalidOffer));
         }
 
-        self.logical_nodes
-            .write()
-            .expect("logical node registry lock poisoned")
-            .insert(node.id.clone(), node);
+        let mut replacement_vm = vm_snapshot.clone();
+        replacement_vm.leases[old_lease_index] = new_lease.clone();
+        if replacement_vm.state == crate::virtual_machine::VirtualMachineState::Failed
+            && replacement_vm
+                .leases
+                .iter()
+                .all(|lease| lease.active_at(now))
+        {
+            replacement_vm.state = crate::virtual_machine::VirtualMachineState::Running;
+        }
 
-        self.virtual_machines
+        // Commit under a fixed lock order and reject stale snapshots. This prevents an
+        // in-flight heal from restoring an older VM/node snapshot over concurrent lifecycle
+        // changes such as stop or destroy.
+        let mut leases = self.leases.write().expect("lease registry lock poisoned");
+        let mut nodes = self
+            .logical_nodes
             .write()
-            .expect("virtual machine registry lock poisoned")
-            .insert(vm.id.id.clone(), vm.clone());
+            .expect("logical node registry lock poisoned");
+        let mut virtual_machines = self
+            .virtual_machines
+            .write()
+            .expect("virtual machine registry lock poisoned");
 
-        Ok((vm, new_lease))
+        if virtual_machines.get(&vm_snapshot.id.id) != Some(&vm_snapshot)
+            || nodes.get(&node_snapshot.id) != Some(&node_snapshot)
+            || leases.get(&old_lease.id.id) != Some(&old_lease)
+        {
+            return Err(ControlError::ConcurrentModification);
+        }
+
+        leases.remove(&old_lease.id.id);
+        leases.insert(new_lease.id.id.clone(), new_lease.clone());
+        nodes.insert(replacement_node.id.clone(), replacement_node);
+        virtual_machines.insert(replacement_vm.id.id.clone(), replacement_vm.clone());
+
+        Ok((replacement_vm, new_lease))
     }
 
     pub fn release_lease(&self, id: &Identity) -> Result<Lease, ControlError> {
