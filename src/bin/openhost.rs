@@ -59,9 +59,10 @@ fn print_help() {
 
 fn run_demo() {
     let fabric = Arc::new(MemoryFabric::new());
+    let demo_participant_id = Identity::new(Kind::Participant);
     fabric
         .upsert(ResourceOffer {
-            participant_id: "local-demo".into(),
+            participant_id: demo_participant_id.id,
             resources: ResourceFragment {
                 cpu: Cpu { cores: 1.0 },
                 memory: Memory { bytes: 256 << 20 },
