@@ -181,6 +181,9 @@ impl Plane {
     }
 
     pub fn start_virtual_machine(&self, id: &Identity) -> Result<VirtualMachine, ControlError> {
+        if id.kind != Kind::VirtualMachine || id.validate().is_err() {
+            return Err(ControlError::VirtualMachineNotFound);
+        }
         let mut vms = self
             .virtual_machines
             .write()
@@ -193,6 +196,9 @@ impl Plane {
     }
 
     pub fn stop_virtual_machine(&self, id: &Identity) -> Result<VirtualMachine, ControlError> {
+        if id.kind != Kind::VirtualMachine || id.validate().is_err() {
+            return Err(ControlError::VirtualMachineNotFound);
+        }
         let mut vms = self
             .virtual_machines
             .write()
@@ -1663,6 +1669,44 @@ mod leased_vm_tests {
         assert!(plane.list_virtual_machines().is_empty());
         assert!(plane.list_logical_nodes().is_empty());
         assert!(plane.list_leases().is_empty());
+    }
+ 
+    #[test]
+    fn vm_lifecycle_rejects_identity_with_the_wrong_kind() {
+        let plane = plane();
+        plane.register_participant(active_participant()).unwrap();
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                SystemTime::now(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let wrong_kind = Identity {
+            id: vm.id.id.clone(),
+            kind: Kind::Participant,
+        };
+        assert_eq!(
+            plane.start_virtual_machine(&wrong_kind).unwrap_err(),
+            ControlError::VirtualMachineNotFound
+        );
+        assert_eq!(
+            plane.stop_virtual_machine(&wrong_kind).unwrap_err(),
+            ControlError::VirtualMachineNotFound
+        );
+        assert_eq!(
+            plane.destroy_virtual_machine(&wrong_kind).unwrap_err(),
+            ControlError::VirtualMachineNotFound
+        );
+
+        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap(), vm);
+        assert_eq!(plane.list_leases(), leases);
+        assert_eq!(plane.list_logical_nodes().len(), 1);
     }
 
 }
