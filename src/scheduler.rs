@@ -162,8 +162,7 @@ impl Scheduler for AggregatingScheduler {
 
         let mut offers: Vec<ResourceOffer> = self.fabric.offers();
 
-        // Validate every offer before strategy-specific sorting. In particular, a NaN CPU
-        // value would make the floating-point comparator non-total if it reached sort_by.
+        // Validate the complete offer set before strategy-specific ranking or allocation.
         let mut seen_participants = HashSet::with_capacity(offers.len());
         for offer in &offers {
             if Identity::parse(&offer.participant_id, Kind::Participant).is_err()
@@ -435,13 +434,22 @@ mod tests {
             }
         }
 
-        let fabric = Arc::new(StaticFabric(vec![ResourceOffer {
-            participant_id: Identity::new(Kind::Participant).id,
-            resources: ResourceFragment {
-                cpu: Cpu { cores: f64::NAN },
-                ..Default::default()
+        let fabric = Arc::new(StaticFabric(vec![
+            ResourceOffer {
+                participant_id: Identity::new(Kind::Participant).id,
+                resources: ResourceFragment {
+                    cpu: Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
             },
-        }]));
+            ResourceOffer {
+                participant_id: Identity::new(Kind::Participant).id,
+                resources: ResourceFragment {
+                    cpu: Cpu { cores: f64::NAN },
+                    ..Default::default()
+                },
+            },
+        ]));
         let scheduler =
             AggregatingScheduler::with_strategy(fabric, SchedulingStrategy::MinFragmentation);
         let requirement = ResourceFragment {
