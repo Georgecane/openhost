@@ -1345,6 +1345,58 @@ mod leased_vm_tests {
     }
 
     #[test]
+    fn control_plane_can_heal_after_expired_lease_was_reaped() {
+        let plane = plane();
+        let failed_participant = active_participant();
+        let replacement_participant = active_participant();
+        let failed_id = failed_participant.snapshot().id;
+        let replacement_id = replacement_participant.snapshot().id.clone();
+        plane
+            .register_participant(Arc::clone(&failed_participant))
+            .unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        failed_participant
+            .drain(created_at + Duration::from_secs(5))
+            .unwrap();
+
+        let reaped = plane
+            .reap_expired_leases(created_at + Duration::from_secs(31))
+            .unwrap();
+        assert_eq!(reaped, leases);
+        assert_eq!(
+            plane.get_lease(&leases[0].id).unwrap_err(),
+            ControlError::LeaseNotFound
+        );
+
+        plane.register_participant(replacement_participant).unwrap();
+        let (healed_vm, new_lease) = plane
+            .heal_virtual_machine(
+                &vm.id,
+                &failed_id,
+                created_at + Duration::from_secs(31),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(new_lease.participant_id, replacement_id);
+        assert_eq!(healed_vm.leases.len(), 1);
+        assert_eq!(healed_vm.leases[0], new_lease);
+        assert_eq!(plane.get_lease(&new_lease.id).unwrap(), new_lease);
+    }
+
+    #[test]
     fn control_plane_query_and_reap_leases() {
         let plane = plane();
         let participant = active_participant();
