@@ -241,10 +241,12 @@ impl Plane {
             .virtual_machines
             .read()
             .expect("virtual machine registry lock poisoned");
+        if id.kind != Kind::VirtualMachine || id.validate().is_err() {
+            return Err(ControlError::VirtualMachineNotFound);
+        }
         let vm_snapshot = virtual_machines
             .get(&id.id)
             .cloned()
-            .filter(|vm| id.kind == Kind::VirtualMachine && id.validate().is_ok())
             .ok_or(ControlError::VirtualMachineNotFound)?;
         let node = nodes
             .get(&vm_snapshot.node_id.id)
