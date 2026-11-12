@@ -350,7 +350,12 @@ pub fn decode_advertisement(data: &[u8]) -> Result<Advertisement, DiscoveryError
             .try_into()
             .map_err(|_| DiscoveryError::MalformedFrame)?,
     );
-    let observed_at = SystemTime::UNIX_EPOCH + Duration::new(secs, subsec_nanos);
+    if subsec_nanos >= 1_000_000_000 {
+        return Err(DiscoveryError::MalformedFrame);
+    }
+    let observed_at = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(secs, subsec_nanos))
+        .ok_or(DiscoveryError::InvalidTimestamp)?;
 
     use crate::capability::{
         Capability, ComputeCapability, Latency, Lifetime, MemoryCapability, NetworkCapability,
@@ -665,6 +670,26 @@ mod tests {
         assert_eq!(
             decode_advertisement(&[DISCOVERY_PROTOCOL_VERSION, 0, 5, 65]).unwrap_err(),
             DiscoveryError::MalformedFrame
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_invalid_timestamp_components() {
+        let mut invalid_subseconds = encode_advertisement(&sample_advertisement()).unwrap();
+        let length = invalid_subseconds.len();
+        invalid_subseconds[length - 4..].copy_from_slice(&1_000_000_000u32.to_be_bytes());
+        assert_eq!(
+            decode_advertisement(&invalid_subseconds).unwrap_err(),
+            DiscoveryError::MalformedFrame
+        );
+
+        let mut overflowing_timestamp = encode_advertisement(&sample_advertisement()).unwrap();
+        let length = overflowing_timestamp.len();
+        overflowing_timestamp[length - 12..length - 4]
+            .copy_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(
+            decode_advertisement(&overflowing_timestamp).unwrap_err(),
+            DiscoveryError::InvalidTimestamp
         );
     }
 
