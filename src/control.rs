@@ -335,7 +335,18 @@ impl Plane {
             .position(|lease| lease.participant_id == *failed_participant_id)
             .ok_or(ControlError::LeaseNotFound)?;
         let old_lease = vm_snapshot.leases[old_lease_index].clone();
-        if self.get_lease(&old_lease.id)? != old_lease {
+        // The maintenance reaper may already have removed an expired lease. Capture the
+        // current stored value (including absence) and compare it again at commit time.
+        let old_stored_lease = self
+            .leases
+            .read()
+            .expect("lease registry lock poisoned")
+            .get(&old_lease.id.id)
+            .cloned();
+        if old_stored_lease
+            .as_ref()
+            .is_some_and(|stored| stored != &old_lease)
+        {
             return Err(ControlError::ConcurrentModification);
         }
 
@@ -434,7 +445,7 @@ impl Plane {
 
         if virtual_machines.get(&vm_snapshot.id.id) != Some(&vm_snapshot)
             || nodes.get(&node_snapshot.id) != Some(&node_snapshot)
-            || leases.get(&old_lease.id.id) != Some(&old_lease)
+            || leases.get(&old_lease.id.id).cloned() != old_stored_lease
         {
             return Err(ControlError::ConcurrentModification);
         }
