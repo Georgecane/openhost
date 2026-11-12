@@ -160,7 +160,7 @@ OpenHost provides built-in concrete runtime engines:
 When a participant experiences churn, drains, or disconnects during execution:
 
 - `audit_virtual_machine_health`: checks lease expiry and participant state. Discovery observations are currently unauthenticated hints and must not be treated as a security decision.
-- `heal_virtual_machine`: attempts to replace an unhealthy participant allocation with an active local participant offer while retaining the logical VM identity. This is an early control-plane mechanism, not yet a transactional, crash-safe distributed migration protocol.
+- `heal_virtual_machine`: attempts to replace an unhealthy participant allocation with an active local participant offer while retaining the logical VM identity. It validates snapshots and commits the in-memory VM, node, and lease registry updates under a fixed lock order. This is not a durable or crash-safe distributed migration protocol.
 - `reap_expired_leases`: control plane maintenance that audits and prunes expired leases.
 
 ## CLI commands
