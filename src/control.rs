@@ -231,28 +231,30 @@ impl Plane {
         workload: &WorkItem,
         backend: &B,
     ) -> Result<ExecutionReceipt, ControlError> {
-        let mut vm = self
-            .virtual_machines
-            .read()
-            .expect("virtual machine registry lock poisoned")
-            .get(&id.id)
-            .cloned()
-            .ok_or(ControlError::VirtualMachineNotFound)?;
+        let vm_snapshot = self.get_virtual_machine(id)?;
 
         let node = self
             .logical_nodes
             .read()
             .expect("logical node registry lock poisoned")
-            .get(&vm.node_id.id)
+            .get(&vm_snapshot.node_id.id)
             .cloned()
             .ok_or(ControlError::VirtualMachineNotFound)?;
 
-        let result = vm.execute(&node, workload, backend);
+        // Execute against a snapshot without holding registry locks across backend I/O.
+        // Commit the resulting VM state only if no lifecycle operation changed or removed
+        // the VM in the meantime. In particular, never reinsert a VM destroyed mid-execution.
+        let mut updated_vm = vm_snapshot.clone();
+        let result = updated_vm.execute(&node, workload, backend);
 
-        self.virtual_machines
+        let mut virtual_machines = self
+            .virtual_machines
             .write()
-            .expect("virtual machine registry lock poisoned")
-            .insert(vm.id.id.clone(), vm);
+            .expect("virtual machine registry lock poisoned");
+        if virtual_machines.get(&vm_snapshot.id.id) != Some(&vm_snapshot) {
+            return Err(ControlError::ConcurrentModification);
+        }
+        virtual_machines.insert(updated_vm.id.id.clone(), updated_vm);
 
         result.map_err(ControlError::VirtualMachine)
     }
@@ -1455,5 +1457,84 @@ mod leased_vm_tests {
         assert_eq!(reaped.len(), 1);
         assert_eq!(reaped[0].id, leases[0].id);
         assert!(plane.list_leases().is_empty());
+    }    
+    #[test]
+    fn execution_does_not_resurrect_destroyed_vm_after_backend_finishes() {
+        use std::sync::Barrier;
+
+        struct BlockingBackend {
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+        }
+
+        impl ExecutionBackend for BlockingBackend {
+            fn execute(
+                &self,
+                plan: &ExecutionPlan,
+                workload: &WorkItem,
+            ) -> Result<ExecutionReceipt, ExecutionError> {
+                self.entered.wait();
+                self.release.wait();
+                Ok(ExecutionReceipt {
+                    workload_id: workload.id.clone(),
+                    node_id: plan.node_id.clone(),
+                    dispatched_units: plan.units.len(),
+                })
+            }
+        }
+
+        let plane = Arc::new(plane());
+        plane.register_participant(active_participant()).unwrap();
+
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                SystemTime::now(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        plane.start_virtual_machine(&vm.id).unwrap();
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let backend = BlockingBackend {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let worker_plane = Arc::clone(&plane);
+        let worker_vm_id = vm.id.clone();
+        let workload = WorkItem {
+            id: "destroy-during-execution".into(),
+            payload: Vec::new(),
+        };
+        let execution = std::thread::spawn(move || {
+            worker_plane.execute_virtual_machine(&worker_vm_id, &workload, &backend)
+        });
+
+        entered.wait();
+        plane.destroy_virtual_machine(&vm.id).unwrap();
+        assert!(plane.list_leases().is_empty());
+        assert!(plane.list_logical_nodes().is_empty());
+
+        release.wait();
+        assert_eq!(
+            execution.join().unwrap().unwrap_err(),
+            ControlError::ConcurrentModification
+        );
+        assert_eq!(
+            plane.get_virtual_machine(&vm.id).unwrap_err(),
+            ControlError::VirtualMachineNotFound
+        );
+        for lease in leases {
+            assert_eq!(
+                plane.get_lease(&lease.id).unwrap_err(),
+                ControlError::LeaseNotFound
+            );
+        }
     }
+
 }
