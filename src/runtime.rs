@@ -674,8 +674,8 @@ mod tests {
     #[test]
     fn process_command_roundtrips_newlines_and_equals() {
         let command = ProcessCommand::new("/usr/bin/printf")
-            .arg("first line\\nsecond line")
-            .env("VALUE", "one=two\\nthree");
+            .arg("first line\nsecond line")
+            .env("VALUE", "one=two\nthree");
         let encoded = command.encode().unwrap();
         assert_eq!(ProcessCommand::decode(&encoded).unwrap(), command);
     }
