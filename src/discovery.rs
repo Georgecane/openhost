@@ -38,6 +38,7 @@ pub enum DiscoveryError {
     InvalidTimestamp,
     InvalidPolicy,
     StaleSequence,
+    SequenceExhausted,
     NotFound,
     MalformedFrame,
     UnsupportedProtocolVersion,
@@ -130,13 +131,13 @@ impl Registry for MemoryRegistry {
         received_at: SystemTime,
     ) -> Result<(), DiscoveryError> {
         advertisement.validate()?;
-        if received_at < advertisement.observed_at || received_at == SystemTime::UNIX_EPOCH {
+        if received_at == SystemTime::UNIX_EPOCH {
             return Err(DiscoveryError::InvalidTimestamp);
         }
 
         let mut members = self.members.write().expect("discovery lock poisoned");
         if let Some(existing) = members.get(&advertisement.participant.id)
-            && advertisement.sequence < existing.advertisement.sequence
+            && advertisement.sequence <= existing.advertisement.sequence
         {
             return Err(DiscoveryError::StaleSequence);
         }
@@ -377,6 +378,10 @@ pub fn decode_advertisement(data: &[u8]) -> Result<Advertisement, DiscoveryError
         security: Security { trusted },
     };
 
+    if offset != data.len() {
+        return Err(DiscoveryError::MalformedFrame);
+    }
+
     let ad = Advertisement {
         participant,
         capability,
@@ -395,6 +400,7 @@ pub struct DiscoveryBeacon {
     socket: UdpSocket,
     target_address: String,
     advertisement: Advertisement,
+    next_sequence: std::sync::atomic::AtomicU64,
 }
 
 impl DiscoveryBeacon {
@@ -406,10 +412,12 @@ impl DiscoveryBeacon {
         advertisement.validate()?;
         let socket = UdpSocket::bind(bind_address).map_err(|_| DiscoveryError::NetworkFailure)?;
         let _ = socket.set_broadcast(true);
+        let next_sequence = advertisement.sequence;
         Ok(Self {
             socket,
             target_address: target_address.into(),
             advertisement,
+            next_sequence: std::sync::atomic::AtomicU64::new(next_sequence),
         })
     }
 
@@ -420,7 +428,15 @@ impl DiscoveryBeacon {
     }
 
     pub fn broadcast_once(&self) -> Result<(), DiscoveryError> {
-        let payload = encode_advertisement(&self.advertisement)?;
+        let sequence = self
+            .next_sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| DiscoveryError::SequenceExhausted)?;
+        let mut advertisement = self.advertisement.clone();
+        advertisement.sequence = sequence;
+        let payload = encode_advertisement(&advertisement)?;
         self.socket
             .send_to(&payload, &self.target_address)
             .map_err(|_| DiscoveryError::NetworkFailure)?;
@@ -432,6 +448,9 @@ impl DiscoveryBeacon {
         shutdown: &AtomicBool,
         interval: Duration,
     ) -> Result<(), DiscoveryError> {
+        if interval.is_zero() {
+            return Err(DiscoveryError::InvalidPolicy);
+        }
         while !shutdown.load(Ordering::Relaxed) {
             self.broadcast_once()?;
             let start = std::time::Instant::now();
@@ -500,18 +519,43 @@ impl DiscoveryListener {
     }
 }
 
+/// Projects discovered peers into scheduler offers.
+///
+/// UDP advertisements are unauthenticated hints. The default constructor therefore fails
+/// closed and emits no scheduler offers. The opt-in constructor is only suitable for isolated
+/// test networks where every sender is already trusted by the operator.
 pub struct DiscoveryFabric {
     registry: Arc<dyn Registry>,
+    allow_unverified_advertisements: bool,
 }
 
 impl DiscoveryFabric {
+    /// Create a fail-closed discovery fabric. Offers remain empty until an authenticated
+    /// discovery mechanism is added.
     pub fn new(registry: Arc<dyn Registry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            allow_unverified_advertisements: false,
+        }
+    }
+
+    /// Explicitly allow unsigned UDP advertisements to become resource offers.
+    ///
+    /// Do not use this option on untrusted networks or for workloads with security impact.
+    pub fn with_unverified_advertisements(registry: Arc<dyn Registry>) -> Self {
+        Self {
+            registry,
+            allow_unverified_advertisements: true,
+        }
     }
 }
 
 impl crate::fabric::Fabric for DiscoveryFabric {
     fn offers(&self) -> Vec<crate::fabric::ResourceOffer> {
+        if !self.allow_unverified_advertisements {
+            return Vec::new();
+        }
+
         let Ok(members) = self.registry.members_at(SystemTime::now()) else {
             return Vec::new();
         };
@@ -625,6 +669,33 @@ mod tests {
     }
 
     #[test]
+    fn decoder_rejects_trailing_bytes() {
+        let mut encoded = encode_advertisement(&sample_advertisement()).unwrap();
+        encoded.push(0);
+        assert_eq!(
+            decode_advertisement(&encoded).unwrap_err(),
+            DiscoveryError::MalformedFrame
+        );
+    }
+
+    #[test]
+    fn registry_rejects_replayed_sequence_numbers() {
+        let policy = FreshnessPolicy {
+            stale_after: Duration::from_secs(5),
+            expire_after: Duration::from_secs(10),
+        };
+        let registry = MemoryRegistry::new(policy).unwrap();
+        let advertisement = sample_advertisement();
+        let now = SystemTime::now();
+        registry.upsert(advertisement.clone(), now).unwrap();
+
+        assert_eq!(
+            registry.upsert(advertisement, now + Duration::from_secs(1)).unwrap_err(),
+            DiscoveryError::StaleSequence
+        );
+    }
+
+    #[test]
     fn discovery_beacon_and_listener_exchange_advertisement_over_udp() {
         let policy = FreshnessPolicy {
             stale_after: Duration::from_secs(5),
@@ -672,6 +743,21 @@ mod tests {
     }
 
     #[test]
+    fn discovery_fabric_fails_closed_for_unsigned_advertisements() {
+        use crate::fabric::Fabric;
+
+        let policy = FreshnessPolicy {
+            stale_after: Duration::from_secs(60),
+            expire_after: Duration::from_secs(120),
+        };
+        let registry = Arc::new(MemoryRegistry::new(policy).unwrap());
+        let ad = sample_advertisement();
+        registry.upsert(ad, SystemTime::now()).unwrap();
+
+        assert!(DiscoveryFabric::new(registry).offers().is_empty());
+    }
+
+    #[test]
     fn discovery_fabric_yields_active_member_offers() {
         use crate::fabric::Fabric;
 
@@ -680,7 +766,7 @@ mod tests {
             expire_after: Duration::from_secs(120),
         };
         let registry = Arc::new(MemoryRegistry::new(policy).unwrap());
-        let fabric = DiscoveryFabric::new(registry.clone());
+        let fabric = DiscoveryFabric::with_unverified_advertisements(registry.clone());
 
         // Empty registry produces no offers
         assert!(fabric.offers().is_empty());
