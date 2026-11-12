@@ -23,6 +23,7 @@ pub enum ControlError {
     VirtualMachineNotFound,
     ParticipantNotFound,
     ParticipantNotAllocated,
+    LogicalNodeNotFound,
     Scheduler(SchedulerError),
     Node(NodeError),
     Execution(ExecutionError),
@@ -534,6 +535,59 @@ impl Plane {
             .get(&id.id)
             .cloned()
             .ok_or(ControlError::LeaseNotFound)
+    }
+
+    pub fn list_virtual_machines(&self) -> Vec<VirtualMachine> {
+        self.virtual_machines
+            .read()
+            .expect("virtual machine registry lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn list_logical_nodes(&self) -> Vec<LogicalNode> {
+        self.logical_nodes
+            .read()
+            .expect("logical node registry lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_logical_node(&self, id: &str) -> Result<LogicalNode, ControlError> {
+        self.logical_nodes
+            .read()
+            .expect("logical node registry lock poisoned")
+            .get(id)
+            .cloned()
+            .ok_or(ControlError::LogicalNodeNotFound)
+    }
+
+    pub fn list_leases(&self) -> Vec<Lease> {
+        self.leases
+            .read()
+            .expect("lease registry lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn reap_expired_leases(&self, now: SystemTime) -> Result<Vec<Lease>, ControlError> {
+        if now == SystemTime::UNIX_EPOCH {
+            return Err(ControlError::InvalidTime);
+        }
+        let mut leases = self.leases.write().expect("lease registry lock poisoned");
+        let mut expired = Vec::new();
+        leases.retain(|_, lease| {
+            if now >= lease.expires_at {
+                expired.push(lease.clone());
+                false
+            } else {
+                true
+            }
+        });
+        Ok(expired)
     }
 }
 
@@ -1075,5 +1129,66 @@ mod leased_vm_tests {
             .audit_virtual_machine_health(&vm.id, created_at + Duration::from_secs(10))
             .unwrap();
         assert!(unhealthy_after.is_empty());
+    }
+
+    #[test]
+    fn control_plane_query_and_reap_leases() {
+        let plane = plane();
+        let participant = active_participant();
+        plane.register_participant(participant).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let duration = Duration::from_secs(30);
+
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 0.5 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("echo", "1"),
+                created_at,
+                duration,
+            )
+            .unwrap();
+
+        // Listing VMs
+        let vms = plane.list_virtual_machines();
+        assert_eq!(vms.len(), 1);
+        assert_eq!(vms[0].id, vm.id);
+
+        // Listing logical nodes
+        let nodes = plane.list_logical_nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, vm.node_id.id);
+
+        // Fetching logical node by ID
+        let fetched_node = plane.get_logical_node(&vm.node_id.id).unwrap();
+        assert_eq!(fetched_node.id, vm.node_id.id);
+
+        assert_eq!(
+            plane.get_logical_node("non-existent").unwrap_err(),
+            ControlError::LogicalNodeNotFound
+        );
+
+        // Listing leases
+        let stored_leases = plane.list_leases();
+        assert_eq!(stored_leases.len(), 1);
+        assert_eq!(stored_leases[0].id, leases[0].id);
+
+        // Reaping before expiration does nothing
+        let reaped = plane
+            .reap_expired_leases(created_at + Duration::from_secs(10))
+            .unwrap();
+        assert!(reaped.is_empty());
+        assert_eq!(plane.list_leases().len(), 1);
+
+        // Reaping after expiration removes the lease
+        let reaped = plane
+            .reap_expired_leases(created_at + Duration::from_secs(35))
+            .unwrap();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].id, leases[0].id);
+        assert!(plane.list_leases().is_empty());
     }
 }

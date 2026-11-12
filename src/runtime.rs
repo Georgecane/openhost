@@ -4,6 +4,7 @@ use crate::resource::ResourceFragment;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workload {
@@ -144,6 +145,7 @@ pub enum RuntimeError {
     InvalidResources,
     Unsupported,
     ExecutionFailed,
+    Timeout,
 }
 
 impl fmt::Display for RuntimeError {
@@ -245,6 +247,7 @@ impl ProcessCommand {
 pub struct ProcessRuntime {
     name: String,
     allowed_programs: Option<Vec<String>>,
+    timeout: Option<Duration>,
 }
 
 impl ProcessRuntime {
@@ -252,6 +255,7 @@ impl ProcessRuntime {
         Self {
             name: name.into(),
             allowed_programs: None,
+            timeout: None,
         }
     }
 
@@ -263,7 +267,13 @@ impl ProcessRuntime {
         Self {
             name: name.into(),
             allowed_programs: Some(allowed.into_iter().map(Into::into).collect()),
+            timeout: None,
         }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
@@ -294,11 +304,73 @@ impl Runtime for ProcessRuntime {
         cmd.env("OPENHOST_PARTICIPANT_ID", &context.participant_id.id);
         cmd.env("OPENHOST_NODE_ID", &context.node_id.id);
 
-        let status = cmd.status().map_err(|_| RuntimeError::ExecutionFailed)?;
+        let mut child = cmd.spawn().map_err(|_| RuntimeError::ExecutionFailed)?;
+
+        let status = match self.timeout {
+            None => child.wait().map_err(|_| RuntimeError::ExecutionFailed)?,
+            Some(timeout) => {
+                let start = std::time::Instant::now();
+                let poll_interval = Duration::from_millis(5);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) => {
+                            if start.elapsed() >= timeout {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                return Err(RuntimeError::Timeout);
+                            }
+                            std::thread::sleep(poll_interval);
+                        }
+                        Err(_) => {
+                            let _ = child.kill();
+                            return Err(RuntimeError::ExecutionFailed);
+                        }
+                    }
+                }
+            }
+        };
+
         if !status.success() {
             return Err(RuntimeError::ExecutionFailed);
         }
         Ok(())
+    }
+}
+
+pub type FunctionHandler =
+    Arc<dyn Fn(&RuntimeContext, &Workload) -> Result<(), RuntimeError> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct FunctionRuntime {
+    name: String,
+    handler: FunctionHandler,
+}
+
+impl FunctionRuntime {
+    pub fn new<F>(name: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(&RuntimeContext, &Workload) -> Result<(), RuntimeError> + Send + Sync + 'static,
+    {
+        Self {
+            name: name.into(),
+            handler: Arc::new(handler),
+        }
+    }
+}
+
+impl Runtime for FunctionRuntime {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn run(&self, context: &RuntimeContext, workload: Workload) -> Result<(), RuntimeError> {
+        workload.validate()?;
+        context
+            .resources
+            .validate_requirement()
+            .map_err(|_| RuntimeError::InvalidResources)?;
+        (self.handler)(context, &workload)
     }
 }
 
@@ -544,5 +616,74 @@ mod tests {
         };
 
         assert!(runtime.run(&context, workload).is_ok());
+    }
+
+    #[test]
+    fn process_runtime_enforces_timeout() {
+        let runtime = ProcessRuntime::with_allowlist("process", vec!["sleep"])
+            .with_timeout(Duration::from_millis(50));
+        let context = RuntimeContext::new(
+            Identity::new(Kind::Participant),
+            Identity::new(Kind::LogicalNode),
+            ResourceFragment {
+                cpu: Cpu { cores: 0.5 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let workload = Workload {
+            id: "work-sleep".into(),
+            payload: ProcessCommand::new("sleep").arg("5").encode(),
+        };
+
+        let result = runtime.run(&context, workload);
+        assert_eq!(result.unwrap_err(), RuntimeError::Timeout);
+    }
+
+    #[test]
+    fn function_runtime_executes_closure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let runtime = FunctionRuntime::new("fn-counter", move |_ctx, workload| {
+            if workload.payload == b"increment" {
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            } else {
+                Err(RuntimeError::ExecutionFailed)
+            }
+        });
+
+        assert_eq!(runtime.name(), "fn-counter");
+
+        let context = RuntimeContext::new(
+            Identity::new(Kind::Participant),
+            Identity::new(Kind::LogicalNode),
+            ResourceFragment {
+                cpu: Cpu { cores: 0.5 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let workload = Workload {
+            id: "work-fn".into(),
+            payload: b"increment".to_vec(),
+        };
+
+        assert!(runtime.run(&context, workload).is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let bad_workload = Workload {
+            id: "work-bad".into(),
+            payload: b"invalid".to_vec(),
+        };
+        assert_eq!(
+            runtime.run(&context, bad_workload).unwrap_err(),
+            RuntimeError::ExecutionFailed
+        );
     }
 }

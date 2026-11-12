@@ -500,6 +500,41 @@ impl DiscoveryListener {
     }
 }
 
+pub struct DiscoveryFabric {
+    registry: Arc<dyn Registry>,
+}
+
+impl DiscoveryFabric {
+    pub fn new(registry: Arc<dyn Registry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl crate::fabric::Fabric for DiscoveryFabric {
+    fn offers(&self) -> Vec<crate::fabric::ResourceOffer> {
+        let Ok(members) = self.registry.members_at(SystemTime::now()) else {
+            return Vec::new();
+        };
+
+        members
+            .into_iter()
+            .filter_map(|(member, state)| {
+                if state != State::Active {
+                    return None;
+                }
+                let resources = member.advertisement.capability.to_resource_fragment();
+                if resources.validate().is_err() || resources.is_empty() {
+                    return None;
+                }
+                Some(crate::fabric::ResourceOffer {
+                    participant_id: member.advertisement.participant.id,
+                    resources,
+                })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +669,29 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap().expect("clean shutdown");
+    }
+
+    #[test]
+    fn discovery_fabric_yields_active_member_offers() {
+        use crate::fabric::Fabric;
+
+        let policy = FreshnessPolicy {
+            stale_after: Duration::from_secs(60),
+            expire_after: Duration::from_secs(120),
+        };
+        let registry = Arc::new(MemoryRegistry::new(policy).unwrap());
+        let fabric = DiscoveryFabric::new(registry.clone());
+
+        // Empty registry produces no offers
+        assert!(fabric.offers().is_empty());
+
+        let ad = sample_advertisement();
+        registry.upsert(ad.clone(), SystemTime::now()).unwrap();
+
+        let offers = fabric.offers();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].participant_id, ad.participant.id);
+        assert_eq!(offers[0].resources.cpu.cores, 4.0);
+        assert_eq!(offers[0].resources.memory.bytes, 8 * 1024 * 1024 * 1024);
     }
 }

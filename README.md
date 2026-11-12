@@ -135,12 +135,21 @@ Participants can broadcast their capabilities and resource availability using UD
 
 - `DiscoveryBeacon` periodically broadcasts binary-encoded `Advertisement` frames over UDP.
 - `DiscoveryListener` listens for incoming discovery datagrams, verifies wire protocol version 1, and populates the discovery `Registry` with real-time freshness tracking (`Active` → `Stale` → `Expired`).
+- `DiscoveryFabric` bridges the discovery registry to the resource fabric, dynamically projecting active discovered cluster participants as `ResourceOffer`s for the scheduler.
+
+## Scheduling strategies
+
+`AggregatingScheduler` supports configurable allocation strategies:
+
+- `SchedulingStrategy::DeterministicId`: sorts participant IDs lexicographically for deterministic and reproducible plan generation.
+- `SchedulingStrategy::MinFragmentation`: sorts offers in descending order of available capacity to fulfill requirements using the fewest participants possible, minimizing cross-node network fragmentation.
 
 ## Execution runtimes
 
 OpenHost provides built-in concrete runtime engines:
 
-- `ProcessRuntime`: executes external processes specified by `ProcessCommand` with args, environment variables, optional command allowlisting, and bounded timeouts.
+- `ProcessRuntime`: executes external processes specified by `ProcessCommand` with args, environment variables, optional command allowlisting, and bounded execution timeouts (`with_timeout`).
+- `FunctionRuntime`: executes in-memory closures and functions for low-overhead micro-tasks and embedded workload simulation.
 - `EchoRuntime`: lightweight validation runtime for connectivity and integration verification.
 
 ## Fault tolerance and node healing
@@ -149,6 +158,7 @@ When a participant experiences churn, drains, or disconnects during execution:
 
 - `audit_virtual_machine_health`: checks active VM leases against local registry state, expiration, and discovery status.
 - `heal_virtual_machine`: dynamic reallocation that locates an alternative active participant offer in the fabric, releases the failed participant's lease, issues a replacement lease, and recomposes the `LogicalNode` capacity without tearing down the VM.
+- `reap_expired_leases`: control plane maintenance that audits and prunes expired leases.
 
 ## CLI commands
 
@@ -158,11 +168,18 @@ The `openhost` CLI supports multiple operational modes:
 # Run in-memory scheduling and resource allocation demo
 cargo run --bin openhost -- demo
 
-# Compute a multi-participant allocation plan
+# Compute a multi-participant allocation plan (with optional strategy)
 cargo run --bin openhost -- plan --cpu 2.5 --memory-mb 1024
+cargo run --bin openhost -- plan --cpu 2.0 --memory-mb 1024 --strategy min-frag
 
 # Launch participant daemon listening on TCP and broadcasting discovery beacon
 cargo run --bin openhost -- participant --bind 127.0.0.1:7443 --cpu 4.0 --memory-mb 2048 --beacon 127.0.0.1:7444
+
+# Listen for peer discovery beacons and monitor cluster nodes
+cargo run --bin openhost -- discover --bind 0.0.0.0:7444
+
+# Demonstrate leased virtual machine lifecycle and dynamic self-healing
+cargo run --bin openhost -- vm
 
 # Dispatch execution to a participant endpoint
 cargo run --bin openhost -- exec --endpoint 127.0.0.1:7443 --runtime echo

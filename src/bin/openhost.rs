@@ -2,7 +2,10 @@ use openhost::capability::{
     Capability, ComputeCapability, Latency, Lifetime, MemoryCapability, NetworkCapability,
     Reliability, Security, StorageCapability,
 };
-use openhost::discovery::{Advertisement, DiscoveryBeacon};
+use openhost::discovery::{
+    Advertisement, DiscoveryBeacon, DiscoveryListener, FreshnessPolicy, MemoryRegistry,
+    Registry as DiscoveryRegistry,
+};
 use openhost::endpoint::{ParticipantExecutionEndpoint, RegistryRuntimeAdapter};
 use openhost::execution::{ExecutionUnit, WorkItem};
 use openhost::fabric::{MemoryFabric, ResourceOffer};
@@ -10,14 +13,14 @@ use openhost::identity::{Identity, Kind};
 use openhost::node::RuntimeSpec;
 use openhost::resource::{Cpu, Memory, ResourceFragment};
 use openhost::runtime::{EchoRuntime, ProcessCommand, ProcessRuntime, RuntimeRegistry};
-use openhost::scheduler::{AggregatingScheduler, Scheduler};
+use openhost::scheduler::{AggregatingScheduler, Scheduler, SchedulingStrategy};
 use openhost::transport::{
     ExecutionEndpoint, ExecutionRequest, ExecutionStatus, TcpEndpointServer, TcpTransport,
     Transport,
 };
 use std::env;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 fn print_help() {
@@ -28,11 +31,18 @@ fn print_help() {
     println!("  plan [options]             Compute resource allocation plan");
     println!("      --cpu <cores>          Required CPU cores (default: 1.0)");
     println!("      --memory-mb <mb>       Required memory in MB (default: 512)");
+    println!("      --strategy <strat>     Strategy: id | min-frag (default: id)");
     println!("  participant [options]      Run participant daemon listening for execution");
     println!("      --bind <addr:port>     TCP bind address (default: 127.0.0.1:7443)");
     println!("      --cpu <cores>          Offered CPU cores (default: 2.0)");
     println!("      --memory-mb <mb>       Offered memory in MB (default: 1024)");
     println!("      --beacon <addr:port>   Optional UDP broadcast address for discovery");
+    println!("  discover [options]         Listen for UDP peer discovery beacons");
+    println!("      --bind <addr:port>     UDP listen address (default: 0.0.0.0:7444)");
+    println!("      --duration <secs>      Optional listening duration in seconds");
+    println!(
+        "  vm                         Demonstrate leased virtual machine lifecycle & self-healing"
+    );
     println!("  exec [options]             Execute a workload on an endpoint");
     println!(
         "      --endpoint <addr:port> Target participant TCP endpoint (default: 127.0.0.1:7443)"
@@ -81,6 +91,7 @@ fn run_demo() {
 fn run_plan(args: &[String]) {
     let mut cpu_cores = 1.0;
     let mut memory_mb = 512u64;
+    let mut strategy = SchedulingStrategy::DeterministicId;
 
     let mut i = 0;
     while i < args.len() {
@@ -91,6 +102,17 @@ fn run_plan(args: &[String]) {
             }
             "--memory-mb" if i + 1 < args.len() => {
                 memory_mb = args[i + 1].parse().unwrap_or(512);
+                i += 2;
+            }
+            "--strategy" if i + 1 < args.len() => {
+                match args[i + 1].as_str() {
+                    "min-frag" | "min-fragmentation" => {
+                        strategy = SchedulingStrategy::MinFragmentation;
+                    }
+                    _ => {
+                        strategy = SchedulingStrategy::DeterministicId;
+                    }
+                }
                 i += 2;
             }
             _ => {
@@ -138,7 +160,7 @@ fn run_plan(args: &[String]) {
         })
         .unwrap();
 
-    let scheduler = AggregatingScheduler::new(fabric);
+    let scheduler = AggregatingScheduler::with_strategy(fabric, strategy);
     let requirement = ResourceFragment {
         cpu: Cpu { cores: cpu_cores },
         memory: Memory {
@@ -393,6 +415,290 @@ fn run_exec(args: &[String]) {
     }
 }
 
+fn run_discover(args: &[String]) {
+    let mut bind_addr = "0.0.0.0:7444".to_string();
+    let mut duration_secs: Option<u64> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" if i + 1 < args.len() => {
+                bind_addr = args[i + 1].clone();
+                i += 2;
+            }
+            "--duration" if i + 1 < args.len() => {
+                duration_secs = args[i + 1].parse().ok();
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let policy = FreshnessPolicy {
+        stale_after: Duration::from_secs(30),
+        expire_after: Duration::from_secs(60),
+    };
+    let registry = Arc::new(MemoryRegistry::new(policy).expect("create discovery registry"));
+    let listener = match DiscoveryListener::bind(
+        &bind_addr,
+        Arc::clone(&registry) as Arc<dyn openhost::discovery::Registry>,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "Failed to bind discovery listener on {}: {:?}",
+                bind_addr, e
+            );
+            return;
+        }
+    };
+
+    println!("OpenHost Discovery Listener bound to {}", bind_addr);
+    println!(
+        "Listening for peer advertisement beacons (wire protocol v{})...",
+        openhost::discovery::DISCOVERY_PROTOCOL_VERSION
+    );
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_signal = Arc::clone(&shutdown);
+
+    if let Some(dur) = duration_secs {
+        println!("Will listen for {} second(s)...", dur);
+        let s = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(dur));
+            s.store(true, Ordering::Relaxed);
+        });
+    } else {
+        println!("Press Ctrl+C to terminate.\n");
+    }
+
+    let listener_handle = std::thread::spawn(move || {
+        let _ = listener.listen_until(&shutdown_signal);
+    });
+
+    let start = std::time::Instant::now();
+    let mut last_count = 0;
+    while !shutdown.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(200));
+        let members = registry.members();
+        if members.len() != last_count {
+            last_count = members.len();
+            println!("\nDiscovered Cluster Participants ({}):", members.len());
+            for (idx, m) in members.iter().enumerate() {
+                let cap = &m.advertisement.capability;
+                println!(
+                    "  [{}] Participant: {}\n      Compute: {:.2} CPU cores, {} GPU units | Memory: {} MB | Storage: {} GB\n      Bandwidth: {} Mbps | Sequence: #{}",
+                    idx + 1,
+                    m.advertisement.participant.id,
+                    cap.compute.cpu_cores,
+                    cap.compute.gpu_units,
+                    cap.memory.bytes >> 20,
+                    cap.storage.bytes >> 30,
+                    cap.network.bits_per_second / 1_000_000,
+                    m.advertisement.sequence
+                );
+            }
+        }
+        if let Some(dur) = duration_secs
+            && start.elapsed() >= Duration::from_secs(dur)
+        {
+            shutdown.store(true, Ordering::Relaxed);
+            break;
+        }
+    }
+
+    let _ = listener_handle.join();
+    println!("Discovery listener stopped.");
+}
+
+fn run_vm() {
+    use openhost::control::Plane;
+    use openhost::discovery::{FreshnessPolicy, MemoryRegistry as DiscoveryMemoryRegistry};
+    use openhost::execution::NoopBackend;
+    use openhost::participant::Participant;
+    use openhost::registry::Registry;
+
+    println!("OpenHost Control Plane & Leased VM Demonstration");
+    println!("=================================================");
+
+    let registry = Arc::new(Registry::new());
+    let discovery = Arc::new(
+        DiscoveryMemoryRegistry::new(FreshnessPolicy {
+            stale_after: Duration::from_secs(30),
+            expire_after: Duration::from_secs(60),
+        })
+        .unwrap(),
+    );
+    let scheduler = Arc::new(AggregatingScheduler::new(registry.clone()));
+    let plane = Plane::new(registry.clone(), discovery, scheduler);
+
+    let now = SystemTime::now();
+
+    // 1. Register 3 participants
+    let p1_id = Identity::new(Kind::Participant);
+    let p2_id = Identity::new(Kind::Participant);
+    let p3_id = Identity::new(Kind::Participant);
+
+    let p1 = Arc::new(
+        Participant::new(
+            p1_id.clone(),
+            ResourceFragment {
+                cpu: Cpu { cores: 1.0 },
+                memory: Memory { bytes: 512 << 20 },
+                ..Default::default()
+            }
+            .to_capability(0.99, Duration::from_millis(5), true),
+            ResourceFragment {
+                cpu: Cpu { cores: 1.0 },
+                memory: Memory { bytes: 512 << 20 },
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap(),
+    );
+    p1.activate(now).unwrap();
+    plane.register_participant(p1.clone()).unwrap();
+
+    let p2 = Arc::new(
+        Participant::new(
+            p2_id.clone(),
+            ResourceFragment {
+                cpu: Cpu { cores: 2.0 },
+                memory: Memory { bytes: 1024 << 20 },
+                ..Default::default()
+            }
+            .to_capability(0.99, Duration::from_millis(5), true),
+            ResourceFragment {
+                cpu: Cpu { cores: 2.0 },
+                memory: Memory { bytes: 1024 << 20 },
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap(),
+    );
+    p2.activate(now).unwrap();
+    plane.register_participant(p2.clone()).unwrap();
+
+    let p3 = Arc::new(
+        Participant::new(
+            p3_id.clone(),
+            ResourceFragment {
+                cpu: Cpu { cores: 2.0 },
+                memory: Memory { bytes: 1024 << 20 },
+                ..Default::default()
+            }
+            .to_capability(0.99, Duration::from_millis(5), true),
+            ResourceFragment {
+                cpu: Cpu { cores: 2.0 },
+                memory: Memory { bytes: 1024 << 20 },
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap(),
+    );
+    p3.activate(now).unwrap();
+
+    println!("1. Registered initial active participants in fabric:");
+    println!(
+        "   - Participant 1 ({}): 1.0 CPU cores, 512 MB RAM",
+        p1_id.id
+    );
+    println!(
+        "   - Participant 2 ({}): 2.0 CPU cores, 1024 MB RAM",
+        p2_id.id
+    );
+
+    // 2. Create Leased Virtual Machine
+    let req = ResourceFragment {
+        cpu: Cpu { cores: 2.5 },
+        memory: Memory { bytes: 1280 << 20 },
+        ..Default::default()
+    };
+    println!("\n2. Scheduling and creating leased Virtual Machine...");
+    println!("   Required: 2.5 CPU cores, 1280 MB RAM");
+    let lease_duration = Duration::from_secs(120);
+    let (vm, leases) = plane
+        .create_leased_virtual_machine(req, RuntimeSpec::new("echo", "1"), now, lease_duration)
+        .expect("create leased VM");
+
+    println!("   Virtual Machine ID: {}", vm.id.id);
+    println!("   Logical Node ID:    {}", vm.node_id.id);
+    println!("   Backing physical leases ({}):", leases.len());
+    for (i, lease) in leases.iter().enumerate() {
+        println!(
+            "     [{}] Lease {} -> Participant {} ({:.2} cores, {} MB)",
+            i + 1,
+            lease.id.id,
+            lease.participant_id.id,
+            lease.resources.cpu.cores,
+            lease.resources.memory.bytes >> 20
+        );
+    }
+
+    // 3. Start VM and Execute Workload
+    println!("\n3. Starting Virtual Machine and executing workload...");
+    plane.start_virtual_machine(&vm.id).unwrap();
+    let workload = WorkItem {
+        id: "workload-alpha".into(),
+        payload: b"OpenHost distributed VM workload".to_vec(),
+    };
+    let backend = NoopBackend;
+    let receipt = plane
+        .execute_virtual_machine(&vm.id, &workload, &backend)
+        .expect("execution succeeds");
+    println!(
+        "   Workload '{}' dispatched across {} execution unit(s) successfully!",
+        receipt.workload_id, receipt.dispatched_units
+    );
+
+    // 4. Simulate Failure & Audit
+    println!("\n4. Simulating failure/drain of Participant 1...");
+    p1.drain(now + Duration::from_secs(10)).unwrap();
+
+    let unhealthy = plane
+        .audit_virtual_machine_health(&vm.id, now + Duration::from_secs(10))
+        .expect("health audit");
+    println!("   Audit detected unhealthy participant(s):");
+    for u in &unhealthy {
+        println!("     - Participant {}", u.id);
+    }
+
+    // 5. Dynamic Self-Healing
+    println!("\n5. Registering spare Participant 3 and performing dynamic VM healing...");
+    plane.register_participant(p3.clone()).unwrap();
+
+    let (healed_vm, new_lease) = plane
+        .heal_virtual_machine(
+            &vm.id,
+            &p1_id,
+            now + Duration::from_secs(10),
+            Duration::from_secs(110),
+        )
+        .expect("heal VM");
+
+    println!("   Virtual Machine healed successfully without teardown!");
+    println!(
+        "   New replacement lease: {} -> Participant {}",
+        new_lease.id.id, new_lease.participant_id.id
+    );
+    println!("   Healed VM State: {:?}", healed_vm.state);
+
+    let audit_after = plane
+        .audit_virtual_machine_health(&vm.id, now + Duration::from_secs(10))
+        .expect("post-heal audit");
+    println!(
+        "   Post-healing unhealthy participants count: {}",
+        audit_after.len()
+    );
+    println!("\nAll VM operations completed cleanly!");
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let command = args.first().map(|s| s.as_str()).unwrap_or("demo");
@@ -401,6 +707,8 @@ fn main() {
         "demo" => run_demo(),
         "plan" => run_plan(&args[1..]),
         "participant" | "daemon" => run_participant(&args[1..]),
+        "discover" | "listen" => run_discover(&args[1..]),
+        "vm" | "control" => run_vm(),
         "exec" => run_exec(&args[1..]),
         "version" | "--version" | "-v" => {
             println!("OpenHost 0.1.0 (Rust 2024, wire protocol v1)");
@@ -422,5 +730,28 @@ mod tests {
     #[test]
     fn demo_runs_without_panic() {
         run_demo();
+    }
+
+    #[test]
+    fn plan_runs_without_panic() {
+        run_plan(&[
+            "--cpu".into(),
+            "1.5".into(),
+            "--memory-mb".into(),
+            "768".into(),
+        ]);
+        run_plan(&[
+            "--cpu".into(),
+            "2.0".into(),
+            "--memory-mb".into(),
+            "1024".into(),
+            "--strategy".into(),
+            "min-frag".into(),
+        ]);
+    }
+
+    #[test]
+    fn vm_demo_runs_without_panic() {
+        run_vm();
     }
 }

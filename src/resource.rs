@@ -116,6 +116,37 @@ impl ResourceFragment {
                 (Some(actual), Some(required)) => actual >= required,
             }
     }
+
+    pub fn to_capability(
+        &self,
+        availability: f64,
+        latency: Duration,
+        trusted: bool,
+    ) -> crate::capability::Capability {
+        crate::capability::Capability {
+            compute: crate::capability::ComputeCapability {
+                cpu_cores: self.cpu.cores,
+                gpu_units: self.gpu.units,
+            },
+            memory: crate::capability::MemoryCapability {
+                bytes: self.memory.bytes,
+            },
+            storage: crate::capability::StorageCapability {
+                bytes: self.storage.bytes,
+            },
+            network: crate::capability::NetworkCapability {
+                bits_per_second: self.network.bits_per_second,
+            },
+            reliability: crate::capability::Reliability { availability },
+            latency: crate::capability::Latency {
+                to_participant: latency,
+            },
+            lifetime: crate::capability::Lifetime {
+                duration: self.lifetime,
+            },
+            security: crate::capability::Security { trusted },
+        }
+    }
 }
 
 impl Add for ResourceFragment {
