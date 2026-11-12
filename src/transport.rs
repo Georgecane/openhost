@@ -680,7 +680,7 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
     if request.workload.id.is_empty() {
         return Err(TransportError::EmptyWorkloadId);
     }
-    if request.node_id.kind != Kind::LogicalNode {
+    if request.node_id.kind != Kind::LogicalNode || request.node_id.validate().is_err() {
         return Err(TransportError::InvalidNodeIdentity);
     }
     if let Some(source) = &request.source_participant_id
@@ -691,7 +691,11 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
     if request.runtime.name.is_empty() || request.runtime.version.is_empty() {
         return Err(TransportError::InvalidRuntimeSpec);
     }
-    if request.unit.participant_id.kind != Kind::Participant {
+    if request.unit.participant_id.kind != Kind::Participant
+        || request.unit.participant_id.validate().is_err()
+        || request.endpoint.participant_id.kind != Kind::Participant
+        || request.endpoint.participant_id.validate().is_err()
+    {
         return Err(TransportError::InvalidParticipantIdentity);
     }
     if request.endpoint.participant_id != request.unit.participant_id {
