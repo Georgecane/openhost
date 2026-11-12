@@ -517,6 +517,7 @@ impl Plane {
         now: SystemTime,
         duration: Duration,
     ) -> Result<(LogicalNode, Vec<Lease>), ControlError> {
+        runtime.validate().map_err(ControlError::Node)?;
         let (node, leases) = self.create_leased_logical_node(requirement, now, duration)?;
         let node = node.with_runtime(runtime).map_err(ControlError::Node)?;
         Ok((node, leases))
@@ -541,26 +542,30 @@ impl Plane {
             .map_err(ControlError::Scheduler)?;
         let node_id = Identity::parse(&node.id, Kind::LogicalNode)
             .map_err(|_| ControlError::Scheduler(SchedulerError::InsufficientResources))?;
-        let expires_at = now + duration;
         let mut leases = Vec::with_capacity(node.resources.allocations.len());
 
         for allocation in &node.resources.allocations {
             let participant_id = Identity::parse(&allocation.participant_id, Kind::Participant)
-                .map_err(|_| ControlError::Scheduler(SchedulerError::InsufficientResources))?;
-            let lease_id = Identity::new(Kind::Lease);
-            let mut resources = allocation.resources;
-            if resources.lifetime.is_none_or(|l| l > duration) {
-                resources.lifetime = Some(duration);
+                .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
+            let resources = allocation.resources;
+            let allocation_duration = resources
+                .lifetime
+                .map_or(duration, |maximum| duration.min(maximum));
+            if allocation_duration.is_zero() {
+                return Err(ControlError::InvalidLeaseDuration);
             }
+            let expires_at = now
+                .checked_add(allocation_duration)
+                .ok_or(ControlError::InvalidTime)?;
             let lease = Lease::new(
-                lease_id,
+                Identity::new(Kind::Lease),
                 node_id.clone(),
                 participant_id,
                 resources,
                 now,
                 expires_at,
             )
-            .map_err(|_| ControlError::Scheduler(SchedulerError::InsufficientResources))?;
+            .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
             leases.push(lease);
         }
 
