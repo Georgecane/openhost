@@ -66,6 +66,7 @@ pub struct CompositeResource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceError {
     InvalidCpu,
+    InvalidLifetime,
     EmptyRequirement,
     EmptyComposite,
     InvalidAllocation,
@@ -85,6 +86,9 @@ impl ResourceFragment {
     pub fn validate(&self) -> Result<(), ResourceError> {
         if !self.cpu.cores.is_finite() || self.cpu.cores < 0.0 {
             return Err(ResourceError::InvalidCpu);
+        }
+        if self.lifetime.is_some_and(Duration::is_zero) {
+            return Err(ResourceError::InvalidLifetime);
         }
         Ok(())
     }
@@ -203,6 +207,8 @@ impl CompositeResource {
             capacity = capacity + allocation.resources;
         }
 
+        capacity.validate()?;
+
         Ok(Self {
             capacity,
             allocations,
@@ -237,6 +243,37 @@ mod tests {
             cpu: Cpu { cores },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn zero_resource_lifetime_is_rejected() {
+        let resource = ResourceFragment {
+            cpu: Cpu { cores: 1.0 },
+            lifetime: Some(Duration::ZERO),
+            ..Default::default()
+        };
+
+        assert_eq!(resource.validate().unwrap_err(), ResourceError::InvalidLifetime);
+        assert_eq!(
+            resource.validate_requirement().unwrap_err(),
+            ResourceError::InvalidLifetime
+        );
+    }
+
+    #[test]
+    fn composed_cpu_overflow_is_rejected() {
+        let result = CompositeResource::compose(vec![
+            Allocation {
+                participant_id: "a".into(),
+                resources: cpu(f64::MAX),
+            },
+            Allocation {
+                participant_id: "b".into(),
+                resources: cpu(f64::MAX),
+            },
+        ]);
+
+        assert_eq!(result.unwrap_err(), ResourceError::InvalidCpu);
     }
 
     #[test]
