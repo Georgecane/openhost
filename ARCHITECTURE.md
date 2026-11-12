@@ -93,21 +93,12 @@ Freshness is evaluated by policy rather than silently changing participant owner
 
 ## 6. Scheduler
 
-The first scheduler is deterministic and aggregation-based:
+The aggregation scheduler supports two deterministic strategies:
 
-```
-Offers
-  ↓
-Requirement matching
-  ↓
-Partial allocations
-  ↓
-CompositeResource
-  ↓
-LogicalNode
-```
+- `DeterministicId`: sorts validated participant offers by canonical participant ID.
+- `MinFragmentation`: prefers a single full-fit offer with the least normalized excess capacity; otherwise it ranks candidates by balanced coverage across the requested resource dimensions.
 
-It sorts participant IDs to make planning deterministic.
+Both strategies validate the complete offer set, reject duplicate participant identities, preserve allocation lifetime bounds, and produce a `CompositeResource` for the `LogicalNode`. `MinFragmentation` is a greedy heuristic, not a globally optimal placement solver.
 
 Future scheduling policies can incorporate latency, topology, reliability, trust, energy, locality, GPU topology, cost, and failure domains.
 
@@ -129,35 +120,27 @@ Lease duration cannot exceed the lifetime of its backing allocation.
 
 The control plane coordinates:
 
-- local participant registration
-- discovery
-- scheduling
-- logical-node creation
-- lease creation
+- local participant registration and discovery
+- scheduling and logical-node creation
+- lease creation, expiry, and release
+- virtual-machine creation, execution, start/stop, and destruction
+- participant health audits and VM healing
 
-It does not own the domain invariants of those components. Those remain in their respective modules.
+Domain invariants remain in their respective modules. VM/node/lease registry transitions use explicit lock ordering and snapshot checks to reject stale concurrent updates. These are in-process consistency guarantees, not durable transactions.
 
-## 9. Runtime and future VM
+## 9. Runtime and virtual machine
 
-The runtime boundary is deliberately independent of resource discovery.
+The runtime boundary is deliberately independent of resource discovery. The current implementation includes:
 
-The intended progression is:
+- `EchoRuntime` for validation and connectivity tests
+- `FunctionRuntime` for in-memory handlers
+- `ProcessRuntime` for explicitly allowlisted external programs with a timeout
+- `VirtualMachine` as a leased control-plane object with a runtime specification and lifecycle state
+- TCP transport with an mTLS mode and explicit participant-to-client-certificate authorization
 
-```
-Resource Fabric
-      ↓
-Resource Composition
-      ↓
-Logical Machine Contract
-      ↓
-Distributed Execution Model
-      ↓
-Virtual Machine
-```
+The current VM is not yet a distributed CPU or a shared virtual-memory system. It represents a logical resource contract backed by participant allocations. The longer-term goal is to unify the **computational model**, not fake physical shared memory.
 
-The future VM should unify the **computational model**, not fake physical shared memory.
-
-A distributed virtual CPU may map execution units to different participants. Virtual memory may be local, remote, replicated, or sharded. Storage may be distributed. Transport and placement become runtime mechanisms.
+A future distributed virtual CPU may map execution units to different participants. Virtual memory may be local, remote, replicated, or sharded. Storage may be distributed. Transport and placement become runtime mechanisms.
 
 The VM therefore consumes a composite resource rather than creating a separate abstraction that hides the fabric.
 
