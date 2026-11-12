@@ -129,26 +129,29 @@ The endpoint locator must contain a hostname or IP address and port. That hostna
 
 **Certificate management remains the operator's responsibility.** Keep private keys out of source control and rotate/revoke certificates through your CA process. mTLS validates the certificate chain; the explicit grant additionally ensures a caller cannot claim a different participant ID using a certificate assigned to another identity. This implementation does not yet provide automated certificate issuance, revocation distribution, or a cluster-wide trust-policy control plane.
 
+The CLI participant daemon currently uses plain TCP, not the mTLS transport. The process runtime is disabled unless an executable is explicitly allowlisted, and that opt-in is accepted only for loopback binds. Do not expose this CLI daemon to an untrusted network; use the mTLS API with a properly managed trust domain for remote execution.
+
 ## Discovery and network beacons
 
-Participants can broadcast their capabilities and resource availability using UDP beacons:
+Participants can broadcast capability and resource claims using versioned UDP beacons:
 
-- `DiscoveryBeacon` periodically broadcasts binary-encoded `Advertisement` frames over UDP.
-- `DiscoveryListener` listens for incoming discovery datagrams, verifies wire protocol version 1, and populates the discovery `Registry` with real-time freshness tracking (`Active` → `Stale` → `Expired`).
-- `DiscoveryFabric` bridges the discovery registry to the resource fabric, dynamically projecting active discovered cluster participants as `ResourceOffer`s for the scheduler.
+- `DiscoveryBeacon` broadcasts binary-encoded `Advertisement` frames over UDP with a monotonically increasing sequence number.
+- `DiscoveryListener` validates frame structure and freshness, then records observations as `Active`, `Stale`, or `Expired`.
+- UDP discovery is **unauthenticated**. Participant IDs, capacity, reliability, and the `security.trusted` field are claims, not proof of identity or available resources. Sequence checks prevent simple replay of older frames but do not prevent forged advertisements or sequence-jump attacks.
+- `DiscoveryFabric::new` therefore fails closed and emits no scheduler offers. `with_unverified_advertisements` is an explicit opt-in for isolated test networks only. Do not use unsigned discovery data for scheduling or execution on an untrusted network.
 
 ## Scheduling strategies
 
 `AggregatingScheduler` supports configurable allocation strategies:
 
 - `SchedulingStrategy::DeterministicId`: sorts participant IDs lexicographically for deterministic and reproducible plan generation.
-- `SchedulingStrategy::MinFragmentation`: sorts offers in descending order of available capacity to fulfill requirements using the fewest participants possible, minimizing cross-node network fragmentation.
+- `SchedulingStrategy::MinFragmentation`: prefers a single offer that satisfies the whole request with the least normalized excess capacity; when no single offer fits, it uses balanced coverage across requested resource dimensions. This is a deterministic greedy heuristic, not a globally optimal bin-packing solver.
 
 ## Execution runtimes
 
 OpenHost provides built-in concrete runtime engines:
 
-- `ProcessRuntime`: executes external processes specified by `ProcessCommand` with args, environment variables, optional command allowlisting, and bounded execution timeouts (`with_timeout`).
+- `ProcessRuntime`: executes external processes specified by bounded, versioned `ProcessCommand` payloads. It denies all programs by default, supports explicit executable allowlists, and applies a 30-second default timeout. It is not an OS sandbox and does not enforce the CPU or memory values in `RuntimeContext`; process execution must be enabled only for deliberately trusted workloads.
 - `FunctionRuntime`: executes in-memory closures and functions for low-overhead micro-tasks and embedded workload simulation.
 - `EchoRuntime`: lightweight validation runtime for connectivity and integration verification.
 
@@ -156,8 +159,8 @@ OpenHost provides built-in concrete runtime engines:
 
 When a participant experiences churn, drains, or disconnects during execution:
 
-- `audit_virtual_machine_health`: checks active VM leases against local registry state, expiration, and discovery status.
-- `heal_virtual_machine`: dynamic reallocation that locates an alternative active participant offer in the fabric, releases the failed participant's lease, issues a replacement lease, and recomposes the `LogicalNode` capacity without tearing down the VM.
+- `audit_virtual_machine_health`: checks lease expiry and participant state. Discovery observations are currently unauthenticated hints and must not be treated as a security decision.
+- `heal_virtual_machine`: attempts to replace an unhealthy participant allocation with an active local participant offer while retaining the logical VM identity. This is an early control-plane mechanism, not yet a transactional, crash-safe distributed migration protocol.
 - `reap_expired_leases`: control plane maintenance that audits and prunes expired leases.
 
 ## CLI commands
@@ -175,6 +178,9 @@ cargo run --bin openhost -- plan --cpu 2.0 --memory-mb 1024 --strategy min-frag
 # Launch participant daemon listening on TCP and broadcasting discovery beacon
 cargo run --bin openhost -- participant --bind 127.0.0.1:7443 --cpu 4.0 --memory-mb 2048 --beacon 127.0.0.1:7444
 
+# Opt in to a narrowly allowlisted process runtime on loopback only
+cargo run --bin openhost -- participant --bind 127.0.0.1:7443 --allow-program /usr/bin/true
+
 # Listen for peer discovery beacons and monitor cluster nodes
 cargo run --bin openhost -- discover --bind 0.0.0.0:7444
 
@@ -183,7 +189,7 @@ cargo run --bin openhost -- vm
 
 # Dispatch execution to a participant endpoint
 cargo run --bin openhost -- exec --endpoint 127.0.0.1:7443 --runtime echo
-cargo run --bin openhost -- exec --endpoint 127.0.0.1:7443 --runtime process --program true
+cargo run --bin openhost -- exec --endpoint 127.0.0.1:7443 --runtime process --program /usr/bin/true
 ```
 
 ## Development
