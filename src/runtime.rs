@@ -163,6 +163,12 @@ pub struct ProcessCommand {
     pub env: Vec<(String, String)>,
 }
 
+const PROCESS_COMMAND_MAGIC: &[u8; 4] = b"OHC\x01";
+const MAX_PROCESS_COMMAND_BYTES: usize = 1024 * 1024;
+const MAX_PROCESS_STRING_BYTES: usize = 64 * 1024;
+const MAX_PROCESS_ARGS: usize = 256;
+const MAX_PROCESS_ENV: usize = 128;
+
 impl ProcessCommand {
     pub fn new(program: impl Into<String>) -> Self {
         Self {
@@ -193,53 +199,162 @@ impl ProcessCommand {
         self
     }
 
-    pub fn encode(&self) -> Vec<u8> {
-        let mut lines = Vec::new();
-        lines.push(self.program.clone());
-        lines.push(self.args.len().to_string());
+    /// Encode a bounded, versioned command payload.
+    ///
+    /// Length-prefixing keeps newlines and other ordinary UTF-8 characters unambiguous.
+    pub fn encode(&self) -> Result<Vec<u8>, RuntimeError> {
+        validate_process_command(self)?;
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(PROCESS_COMMAND_MAGIC);
+        write_process_string(&mut payload, &self.program)?;
+        write_process_count(&mut payload, self.args.len())?;
         for arg in &self.args {
-            lines.push(arg.clone());
+            write_process_string(&mut payload, arg)?;
         }
-        lines.push(self.env.len().to_string());
-        for (k, v) in &self.env {
-            lines.push(format!("{}={}", k, v));
+        write_process_count(&mut payload, self.env.len())?;
+        for (key, value) in &self.env {
+            write_process_string(&mut payload, key)?;
+            write_process_string(&mut payload, value)?;
         }
-        lines.join("\n").into_bytes()
+
+        if payload.len() > MAX_PROCESS_COMMAND_BYTES {
+            return Err(RuntimeError::Unsupported);
+        }
+        Ok(payload)
     }
 
+    /// Decode a command without allocating from unchecked peer-supplied counts.
     pub fn decode(payload: &[u8]) -> Result<Self, RuntimeError> {
-        let text = std::str::from_utf8(payload).map_err(|_| RuntimeError::Unsupported)?;
-        let mut lines = text.lines();
-        let program = lines.next().ok_or(RuntimeError::Unsupported)?;
-        if program.is_empty() {
+        if payload.len() > MAX_PROCESS_COMMAND_BYTES || !payload.starts_with(PROCESS_COMMAND_MAGIC)
+        {
             return Err(RuntimeError::Unsupported);
         }
 
-        let args_count_str = lines.next().ok_or(RuntimeError::Unsupported)?;
-        let args_count: usize = args_count_str
-            .parse()
-            .map_err(|_| RuntimeError::Unsupported)?;
+        let mut reader = ProcessCommandReader::new(&payload[PROCESS_COMMAND_MAGIC.len()..]);
+        let program = reader.string()?;
+        let args_count = reader.count(MAX_PROCESS_ARGS)?;
         let mut args = Vec::with_capacity(args_count);
         for _ in 0..args_count {
-            args.push(lines.next().ok_or(RuntimeError::Unsupported)?.to_string());
+            args.push(reader.string()?);
         }
 
-        let env_count_str = lines.next().ok_or(RuntimeError::Unsupported)?;
-        let env_count: usize = env_count_str
-            .parse()
-            .map_err(|_| RuntimeError::Unsupported)?;
+        let env_count = reader.count(MAX_PROCESS_ENV)?;
         let mut env = Vec::with_capacity(env_count);
         for _ in 0..env_count {
-            let line = lines.next().ok_or(RuntimeError::Unsupported)?;
-            let (k, v) = line.split_once('=').ok_or(RuntimeError::Unsupported)?;
-            env.push((k.to_string(), v.to_string()));
+            env.push((reader.string()?, reader.string()?));
         }
+        reader.finish()?;
 
-        Ok(Self {
-            program: program.to_string(),
+        let command = Self {
+            program,
             args,
             env,
-        })
+        };
+        validate_process_command(&command)?;
+        Ok(command)
+    }
+}
+
+fn validate_process_command(command: &ProcessCommand) -> Result<(), RuntimeError> {
+    if command.program.is_empty()
+        || command.program.as_bytes().contains(&0)
+        || command.args.len() > MAX_PROCESS_ARGS
+        || command.env.len() > MAX_PROCESS_ENV
+        || command.program.len() > MAX_PROCESS_STRING_BYTES
+        || command
+            .args
+            .iter()
+            .any(|value| value.len() > MAX_PROCESS_STRING_BYTES || value.as_bytes().contains(&0))
+    {
+        return Err(RuntimeError::Unsupported);
+    }
+
+    let mut keys = std::collections::HashSet::with_capacity(command.env.len());
+    for (key, value) in &command.env {
+        if key.is_empty()
+            || key.len() > MAX_PROCESS_STRING_BYTES
+            || value.len() > MAX_PROCESS_STRING_BYTES
+            || key.contains('=')
+            || key.as_bytes().contains(&0)
+            || value.as_bytes().contains(&0)
+            || !keys.insert(key)
+        {
+            return Err(RuntimeError::Unsupported);
+        }
+    }
+    Ok(())
+}
+
+fn write_process_count(payload: &mut Vec<u8>, count: usize) -> Result<(), RuntimeError> {
+    let count = u32::try_from(count).map_err(|_| RuntimeError::Unsupported)?;
+    payload.extend_from_slice(&count.to_be_bytes());
+    Ok(())
+}
+
+fn write_process_string(payload: &mut Vec<u8>, value: &str) -> Result<(), RuntimeError> {
+    if value.len() > MAX_PROCESS_STRING_BYTES {
+        return Err(RuntimeError::Unsupported);
+    }
+    let length = u32::try_from(value.len()).map_err(|_| RuntimeError::Unsupported)?;
+    payload.extend_from_slice(&length.to_be_bytes());
+    payload.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+struct ProcessCommandReader<'a> {
+    payload: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ProcessCommandReader<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self { payload, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], RuntimeError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(RuntimeError::Unsupported)?;
+        if end > self.payload.len() {
+            return Err(RuntimeError::Unsupported);
+        }
+        let bytes = &self.payload[self.offset..end];
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn count(&mut self, maximum: usize) -> Result<usize, RuntimeError> {
+        let count = u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| RuntimeError::Unsupported)?,
+        ) as usize;
+        if count > maximum {
+            return Err(RuntimeError::Unsupported);
+        }
+        Ok(count)
+    }
+
+    fn string(&mut self) -> Result<String, RuntimeError> {
+        let length = u32::from_be_bytes(
+            self.take(4)?
+                .try_into()
+                .map_err(|_| RuntimeError::Unsupported)?,
+        ) as usize;
+        if length > MAX_PROCESS_STRING_BYTES {
+            return Err(RuntimeError::Unsupported);
+        }
+        String::from_utf8(self.take(length)?.to_vec()).map_err(|_| RuntimeError::Unsupported)
+    }
+
+    fn finish(&self) -> Result<(), RuntimeError> {
+        if self.offset == self.payload.len() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Unsupported)
+        }
     }
 }
 
@@ -547,9 +662,49 @@ mod tests {
         let cmd = ProcessCommand::new("true")
             .arg("--version")
             .env("VAR", "123");
-        let encoded = cmd.encode();
+        let encoded = cmd.encode().expect("encode succeeds");
         let decoded = ProcessCommand::decode(&encoded).expect("decode succeeds");
         assert_eq!(cmd, decoded);
+    }
+
+    #[test]
+    fn process_command_roundtrips_newlines_and_equals() {
+        let command = ProcessCommand::new("/usr/bin/printf")
+            .arg("first line\\nsecond line")
+            .env("VALUE", "one=two\\nthree");
+        let encoded = command.encode().unwrap();
+        assert_eq!(ProcessCommand::decode(&encoded).unwrap(), command);
+    }
+
+    #[test]
+    fn process_command_rejects_unbounded_argument_counts() {
+        let mut payload = PROCESS_COMMAND_MAGIC.to_vec();
+        write_process_string(&mut payload, "true").unwrap();
+        payload.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        assert_eq!(
+            ProcessCommand::decode(&payload).unwrap_err(),
+            RuntimeError::Unsupported
+        );
+    }
+
+    #[test]
+    fn process_command_rejects_trailing_bytes_and_duplicate_environment_keys() {
+        let command = ProcessCommand::new("true");
+        let mut payload = command.encode().unwrap();
+        payload.push(0);
+        assert_eq!(
+            ProcessCommand::decode(&payload).unwrap_err(),
+            RuntimeError::Unsupported
+        );
+
+        let duplicate_keys = ProcessCommand::new("true")
+            .env("DUPLICATE", "one")
+            .env("DUPLICATE", "two");
+        assert_eq!(
+            duplicate_keys.encode().unwrap_err(),
+            RuntimeError::Unsupported
+        );
     }
 
     #[test]
@@ -567,7 +722,7 @@ mod tests {
 
         let workload = Workload {
             id: "work-1".into(),
-            payload: ProcessCommand::new("true").encode(),
+            payload: ProcessCommand::new("true").encode().unwrap(),
         };
 
         assert!(runtime.run(&context, workload).is_ok());
@@ -588,7 +743,7 @@ mod tests {
 
         let workload = Workload {
             id: "work-1".into(),
-            payload: ProcessCommand::new("rm").encode(),
+            payload: ProcessCommand::new("rm").encode().unwrap(),
         };
 
         assert_eq!(
@@ -634,7 +789,7 @@ mod tests {
 
         let workload = Workload {
             id: "work-sleep".into(),
-            payload: ProcessCommand::new("sleep").arg("5").encode(),
+            payload: ProcessCommand::new("sleep").arg("5").encode().unwrap(),
         };
 
         let result = runtime.run(&context, workload);
