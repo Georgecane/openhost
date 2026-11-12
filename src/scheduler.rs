@@ -28,7 +28,8 @@ pub enum SchedulingStrategy {
     /// Sort participant IDs lexicographically (deterministic order).
     #[default]
     DeterministicId,
-    /// Sort by available capacity descending to minimize participant fragmentation.
+    /// Prefer a single full-fit offer with the least normalized excess capacity; otherwise
+    /// prefer balanced coverage across the requested resource dimensions.
     MinFragmentation,
 }
 
