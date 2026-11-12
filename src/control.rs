@@ -231,15 +231,27 @@ impl Plane {
         workload: &WorkItem,
         backend: &B,
     ) -> Result<ExecutionReceipt, ControlError> {
-        let vm_snapshot = self.get_virtual_machine(id)?;
-
-        let node = self
+        // Snapshot the node and VM under the same lock order used by heal/destroy.
+        // This avoids pairing a VM from before a heal with a node from after that heal.
+        let nodes = self
             .logical_nodes
             .read()
-            .expect("logical node registry lock poisoned")
+            .expect("logical node registry lock poisoned");
+        let virtual_machines = self
+            .virtual_machines
+            .read()
+            .expect("virtual machine registry lock poisoned");
+        let vm_snapshot = virtual_machines
+            .get(&id.id)
+            .cloned()
+            .filter(|vm| id.kind == Kind::VirtualMachine && id.validate().is_ok())
+            .ok_or(ControlError::VirtualMachineNotFound)?;
+        let node = nodes
             .get(&vm_snapshot.node_id.id)
             .cloned()
             .ok_or(ControlError::VirtualMachineNotFound)?;
+        drop(virtual_machines);
+        drop(nodes);
 
         // Execute against a snapshot without holding registry locks across backend I/O.
         // Commit the resulting VM state only if no lifecycle operation changed or removed
@@ -348,7 +360,10 @@ impl Plane {
         if old_stored_lease
             .as_ref()
             .is_some_and(|stored| stored != &old_lease)
+            || (old_stored_lease.is_none() && now < old_lease.expires_at)
         {
+            // Only an actually expired lease may be absent because the reaper removed it.
+            // A missing but still-valid lease indicates an explicit release or a race.
             return Err(ControlError::ConcurrentModification);
         }
 
@@ -1535,6 +1550,51 @@ mod leased_vm_tests {
                 ControlError::LeaseNotFound
             );
         }
+    }
+ 
+    #[test]
+    fn control_plane_does_not_heal_after_an_unexpired_lease_was_explicitly_released() {
+        let plane = plane();
+        let failed_participant = active_participant();
+        let replacement_participant = active_participant();
+        let failed_id = failed_participant.snapshot().id;
+        plane
+            .register_participant(Arc::clone(&failed_participant))
+            .unwrap();
+
+        let created_at = SystemTime::now();
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(120),
+            )
+            .unwrap();
+        failed_participant
+            .drain(created_at + Duration::from_secs(1))
+            .unwrap();
+        plane.release_lease(&leases[0].id).unwrap();
+        plane.register_participant(replacement_participant).unwrap();
+
+        let before = plane.get_virtual_machine(&vm.id).unwrap();
+        assert_eq!(
+            plane
+                .heal_virtual_machine(
+                    &vm.id,
+                    &failed_id,
+                    created_at + Duration::from_secs(2),
+                    Duration::from_secs(60),
+                )
+                .unwrap_err(),
+            ControlError::ConcurrentModification
+        );
+        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap(), before);
+        assert_eq!(plane.list_leases().len(), 0);
+        assert_eq!(plane.list_logical_nodes().len(), 1);
     }
 
 }
