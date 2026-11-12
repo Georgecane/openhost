@@ -87,7 +87,7 @@ impl ResourceFragment {
         if !self.cpu.cores.is_finite() || self.cpu.cores < 0.0 {
             return Err(ResourceError::InvalidCpu);
         }
-        if self.lifetime.is_some_and(Duration::is_zero) {
+        if self.lifetime.is_some_and(|lifetime| lifetime.is_zero()) {
             return Err(ResourceError::InvalidLifetime);
         }
         Ok(())
