@@ -125,7 +125,7 @@ pub struct ParticipantExecutionEndpoint<E> {
 
 impl<E> ParticipantExecutionEndpoint<E> {
     pub fn new(participant_id: Identity, executor: E) -> Result<Self, EndpointError> {
-        if participant_id.kind != Kind::Participant {
+        if participant_id.kind != Kind::Participant || participant_id.validate().is_err() {
             return Err(EndpointError::InvalidParticipantIdentity);
         }
 
@@ -195,8 +195,14 @@ fn validate_request(
         return Err(EndpointError::EmptyWorkloadId);
     }
 
-    if request.node_id.kind != Kind::LogicalNode {
+    if request.node_id.kind != Kind::LogicalNode || request.node_id.validate().is_err() {
         return Err(EndpointError::InvalidNodeIdentity);
+    }
+
+    if let Some(source) = &request.source_participant_id
+        && (source.kind != Kind::Participant || source.validate().is_err())
+    {
+        return Err(EndpointError::InvalidSourceIdentity);
     }
 
     if request.runtime.name.is_empty() {
@@ -207,7 +213,11 @@ fn validate_request(
         return Err(EndpointError::InvalidRuntimeSpec);
     }
 
-    if request.unit.participant_id.kind != Kind::Participant {
+    if request.unit.participant_id.kind != Kind::Participant
+        || request.unit.participant_id.validate().is_err()
+        || request.endpoint.participant_id.kind != Kind::Participant
+        || request.endpoint.participant_id.validate().is_err()
+    {
         return Err(EndpointError::InvalidParticipantIdentity);
     }
 
@@ -227,6 +237,7 @@ pub enum EndpointError {
     EmptyWorkloadId,
     InvalidParticipantIdentity,
     InvalidNodeIdentity,
+    InvalidSourceIdentity,
     InvalidRuntimeSpec,
     ParticipantMismatch,
     ExecutionFailed {
@@ -406,5 +417,32 @@ mod tests {
                 ),
             }
         );
+    } 
+    #[test]
+    fn endpoint_rejects_malformed_participant_identity() {
+        let invalid_id = Identity {
+            id: "not-a-uuid".into(),
+            kind: Kind::Participant,
+        };
+        assert!(matches!(
+            ParticipantExecutionEndpoint::new(invalid_id, NoopParticipantExecutor),
+            Err(EndpointError::InvalidParticipantIdentity)
+        ));
     }
+
+    #[test]
+    fn endpoint_rejects_malformed_request_identities() {
+        let participant_id = Identity::new(Kind::Participant);
+        let endpoint =
+            ParticipantExecutionEndpoint::new(participant_id.clone(), NoopParticipantExecutor)
+                .unwrap();
+        let mut invalid_request = request(participant_id);
+        invalid_request.node_id.id = "not-a-uuid".into();
+
+        assert_eq!(
+            endpoint.handle(invalid_request).unwrap_err(),
+            EndpointError::InvalidNodeIdentity
+        );
+    }
+
 }
