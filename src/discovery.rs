@@ -165,6 +165,9 @@ impl Registry for MemoryRegistry {
     }
 
     fn get(&self, id: &Identity) -> Result<Member, DiscoveryError> {
+        if id.kind != Kind::Participant || id.validate().is_err() {
+            return Err(DiscoveryError::InvalidAdvertisement);
+        }
         self.members
             .read()
             .expect("discovery lock poisoned")
@@ -805,4 +808,25 @@ mod tests {
         assert_eq!(offers[0].resources.cpu.cores, 4.0);
         assert_eq!(offers[0].resources.memory.bytes, 8 * 1024 * 1024 * 1024);
     }
+    #[test]
+    fn registry_rejects_wrong_identity_kind_on_lookup() {
+        let policy = FreshnessPolicy {
+            stale_after: Duration::from_secs(5),
+            expire_after: Duration::from_secs(10),
+        };
+        let registry = MemoryRegistry::new(policy).unwrap();
+        let advertisement = sample_advertisement();
+        let participant_id = advertisement.participant.clone();
+        registry.upsert(advertisement, SystemTime::now()).unwrap();
+
+        let wrong_kind = Identity {
+            id: participant_id.id,
+            kind: Kind::LogicalNode,
+        };
+        assert_eq!(
+            registry.get(&wrong_kind).unwrap_err(),
+            DiscoveryError::InvalidAdvertisement
+        );
+    }
+
 }
