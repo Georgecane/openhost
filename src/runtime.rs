@@ -366,11 +366,15 @@ pub struct ProcessRuntime {
 }
 
 impl ProcessRuntime {
+    /// Create a process runtime that denies all commands by default.
+    ///
+    /// Use `with_allowlist` to enable specific executables. The default timeout prevents
+    /// accidentally blocking a participant worker indefinitely.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            allowed_programs: None,
-            timeout: None,
+            allowed_programs: Some(Vec::new()),
+            timeout: Some(Duration::from_secs(30)),
         }
     }
 
@@ -382,7 +386,7 @@ impl ProcessRuntime {
         Self {
             name: name.into(),
             allowed_programs: Some(allowed.into_iter().map(Into::into).collect()),
-            timeout: None,
+            timeout: Some(Duration::from_secs(30)),
         }
     }
 
@@ -703,6 +707,29 @@ mod tests {
             .env("DUPLICATE", "two");
         assert_eq!(
             duplicate_keys.encode().unwrap_err(),
+            RuntimeError::Unsupported
+        );
+    }
+
+    #[test]
+    fn process_runtime_denies_commands_by_default() {
+        let runtime = ProcessRuntime::new("process");
+        let context = RuntimeContext::new(
+            Identity::new(Kind::Participant),
+            Identity::new(Kind::LogicalNode),
+            ResourceFragment {
+                cpu: Cpu { cores: 1.0 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let workload = Workload {
+            id: "denied-by-default".into(),
+            payload: ProcessCommand::new("true").encode().unwrap(),
+        };
+
+        assert_eq!(
+            runtime.run(&context, workload).unwrap_err(),
             RuntimeError::Unsupported
         );
     }
