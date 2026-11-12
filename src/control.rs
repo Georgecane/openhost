@@ -1119,6 +1119,80 @@ mod leased_vm_tests {
     }
 
     #[test]
+    fn control_plane_audit_marks_missing_local_participants_unhealthy() {
+        let plane = plane();
+        let participant = active_participant();
+        let participant_id = participant.snapshot().id.clone();
+        plane.register_participant(participant).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(500);
+        let (vm, _) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        plane.registry.remove(&participant_id).unwrap();
+        assert_eq!(
+            plane
+                .audit_virtual_machine_health(&vm.id, created_at + Duration::from_secs(1))
+                .unwrap(),
+            vec![participant_id]
+        );
+    }
+
+    #[test]
+    fn failed_heal_preserves_vm_node_and_original_lease() {
+        let plane = plane();
+        let participant = active_participant();
+        let participant_id = participant.snapshot().id.clone();
+        plane.register_participant(Arc::clone(&participant)).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(700);
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        participant
+            .drain(created_at + Duration::from_secs(1))
+            .unwrap();
+
+        let vm_before = plane.get_virtual_machine(&vm.id).unwrap();
+        let node_before = plane.get_logical_node(&vm.node_id.id).unwrap();
+        let lease_before = plane.get_lease(&leases[0].id).unwrap();
+
+        assert_eq!(
+            plane
+                .heal_virtual_machine(
+                    &vm.id,
+                    &participant_id,
+                    created_at + Duration::from_secs(1),
+                    Duration::from_secs(30),
+                )
+                .unwrap_err(),
+            ControlError::Scheduler(SchedulerError::InsufficientResources)
+        );
+
+        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap(), vm_before);
+        assert_eq!(plane.get_logical_node(&vm.node_id.id).unwrap(), node_before);
+        assert_eq!(plane.get_lease(&leases[0].id).unwrap(), lease_before);
+        assert_eq!(plane.list_leases().len(), 1);
+    }
+
+    #[test]
     fn control_plane_audits_unhealthy_participants_and_heals_vm() {
         let plane = plane();
         let p1 = active_participant();
