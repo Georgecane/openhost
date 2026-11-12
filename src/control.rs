@@ -205,23 +205,45 @@ impl Plane {
     }
 
     pub fn destroy_virtual_machine(&self, id: &Identity) -> Result<VirtualMachine, ControlError> {
-        let vm = {
-            let mut vms = self
-                .virtual_machines
-                .write()
-                .expect("virtual machine registry lock poisoned");
-            vms.remove(&id.id)
-                .ok_or(ControlError::VirtualMachineNotFound)?
-        };
-
-        if !vm.leases.is_empty() {
-            self.release_leases(&vm.leases)?;
+        if id.kind != Kind::VirtualMachine || id.validate().is_err() {
+            return Err(ControlError::VirtualMachineNotFound);
         }
 
-        self.logical_nodes
+        // Match the lock order used by healing. Validate the VM's lease snapshot before
+        // mutating any registry, then remove its VM, leases, and node as one transition.
+        // Missing leases are allowed because the reaper may already have removed expired ones.
+        let mut leases = self.leases.write().expect("lease registry lock poisoned");
+        let mut nodes = self
+            .logical_nodes
             .write()
-            .expect("logical node registry lock poisoned")
-            .remove(&vm.node_id.id);
+            .expect("logical node registry lock poisoned");
+        let mut virtual_machines = self
+            .virtual_machines
+            .write()
+            .expect("virtual machine registry lock poisoned");
+
+        let vm_snapshot = virtual_machines
+            .get(&id.id)
+            .cloned()
+            .ok_or(ControlError::VirtualMachineNotFound)?;
+
+        for lease in &vm_snapshot.leases {
+            if leases
+                .get(&lease.id.id)
+                .is_some_and(|stored| stored != lease)
+            {
+                return Err(ControlError::ConcurrentModification);
+            }
+        }
+
+        let vm = virtual_machines
+            .remove(&id.id)
+            .ok_or(ControlError::VirtualMachineNotFound)?;
+        for lease in &vm.leases {
+            leases.remove(&lease.id.id);
+        }
+        nodes.remove(&vm.node_id.id);
+
         Ok(vm)
     }
 
@@ -1597,6 +1619,50 @@ mod leased_vm_tests {
         assert_eq!(plane.get_virtual_machine(&vm.id).unwrap(), before);
         assert_eq!(plane.list_leases().len(), 0);
         assert_eq!(plane.list_logical_nodes().len(), 1);
+    }
+ 
+    #[test]
+    fn destroy_preserves_all_registries_when_a_lease_snapshot_mismatches() {
+        let plane = plane();
+        plane.register_participant(active_participant()).unwrap();
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                SystemTime::now(),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let mut altered_lease = leases[0].clone();
+        altered_lease.resources.cpu.cores += 1.0;
+        plane
+            .leases
+            .write()
+            .expect("lease registry lock poisoned")
+            .insert(altered_lease.id.id.clone(), altered_lease.clone());
+
+        assert_eq!(
+            plane.destroy_virtual_machine(&vm.id).unwrap_err(),
+            ControlError::ConcurrentModification
+        );
+        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap(), vm);
+        assert_eq!(plane.get_logical_node(&vm.node_id.id).unwrap().id, vm.node_id.id);
+        assert_eq!(plane.get_lease(&leases[0].id).unwrap(), altered_lease);
+
+        plane
+            .leases
+            .write()
+            .expect("lease registry lock poisoned")
+            .insert(leases[0].id.id.clone(), leases[0].clone());
+        plane.destroy_virtual_machine(&vm.id).unwrap();
+
+        assert!(plane.list_virtual_machines().is_empty());
+        assert!(plane.list_logical_nodes().is_empty());
+        assert!(plane.list_leases().is_empty());
     }
 
 }
