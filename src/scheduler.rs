@@ -161,6 +161,19 @@ impl Scheduler for AggregatingScheduler {
             .map_err(|_| SchedulerError::InvalidRequirement)?;
 
         let mut offers: Vec<ResourceOffer> = self.fabric.offers();
+
+        // Validate every offer before strategy-specific sorting. In particular, a NaN CPU
+        // value would make the floating-point comparator non-total if it reached sort_by.
+        let mut seen_participants = HashSet::with_capacity(offers.len());
+        for offer in &offers {
+            if Identity::parse(&offer.participant_id, Kind::Participant).is_err()
+                || offer.resources.validate().is_err()
+                || !seen_participants.insert(offer.participant_id.clone())
+            {
+                return Err(SchedulerError::InvalidOffer);
+            }
+        }
+
         match self.strategy {
             SchedulingStrategy::DeterministicId => {
                 offers.sort_by(|a, b| a.participant_id.cmp(&b.participant_id));
@@ -187,26 +200,10 @@ impl Scheduler for AggregatingScheduler {
             }
         }
 
-        let mut seen_participants = HashSet::with_capacity(offers.len());
-        for offer in &offers {
-            if Identity::parse(&offer.participant_id, Kind::Participant).is_err()
-                || offer.resources.validate().is_err()
-                || !seen_participants.insert(offer.participant_id.clone())
-            {
-                // Validate the complete offer set before allocating, even if an early offer
-                // already satisfies the requirement.
-                return Err(SchedulerError::InvalidOffer);
-            }
-        }
-
         let mut total = ResourceFragment::default();
         let mut allocations = Vec::new();
 
         for offer in offers {
-            if offer.participant_id.is_empty() || offer.resources.validate().is_err() {
-                return Err(SchedulerError::InvalidOffer);
-            }
-
             let remaining = Self::remaining(requirement, total);
             let Some(share) = Self::allocation_share(offer.resources, remaining) else {
                 continue;
@@ -427,5 +424,35 @@ mod tests {
         assert_eq!(node.resources.allocations.len(), 1);
         assert_eq!(node.resources.allocations[0].participant_id, large_p.id);
         assert_eq!(node.resources.allocations[0].resources.cpu.cores, 2.0);
+    } 
+    #[test]
+    fn min_fragmentation_rejects_nan_offers_before_sorting() {
+        struct StaticFabric(Vec<ResourceOffer>);
+
+        impl crate::fabric::Fabric for StaticFabric {
+            fn offers(&self) -> Vec<ResourceOffer> {
+                self.0.clone()
+            }
+        }
+
+        let fabric = Arc::new(StaticFabric(vec![ResourceOffer {
+            participant_id: Identity::new(Kind::Participant).id,
+            resources: ResourceFragment {
+                cpu: Cpu { cores: f64::NAN },
+                ..Default::default()
+            },
+        }]));
+        let scheduler =
+            AggregatingScheduler::with_strategy(fabric, SchedulingStrategy::MinFragmentation);
+        let requirement = ResourceFragment {
+            cpu: Cpu { cores: 1.0 },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scheduler.plan(requirement).unwrap_err(),
+            SchedulerError::InvalidOffer
+        );
     }
+
 }
