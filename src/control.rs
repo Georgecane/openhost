@@ -409,10 +409,12 @@ impl Plane {
         let mut replacement_vm = vm_snapshot.clone();
         replacement_vm.leases[old_lease_index] = new_lease.clone();
         if replacement_vm.state == crate::virtual_machine::VirtualMachineState::Failed
-            && replacement_vm
-                .leases
-                .iter()
-                .all(|lease| lease.active_at(now))
+            && replacement_vm.leases.iter().all(|lease| {
+                lease.active_at(now)
+                    && self.registry.get(&lease.participant_id).is_ok_and(|participant| {
+                        participant.snapshot().state == crate::participant::State::Active
+                    })
+            })
         {
             replacement_vm.state = crate::virtual_machine::VirtualMachineState::Running;
         }
