@@ -703,6 +703,81 @@ mod leased_vm_tests {
     }
 
     #[test]
+    fn leased_vm_caps_expiry_to_participant_allocation_lifetime() {
+        let plane = plane();
+        let lifetime = Duration::from_secs(25);
+        let participant = Arc::new(
+            Participant::new(
+                Identity::new(Kind::Participant),
+                Capability {
+                    compute: ComputeCapability {
+                        cpu_cores: 2.0,
+                        gpu_units: 0,
+                    },
+                    memory: MemoryCapability { bytes: 0 },
+                    storage: StorageCapability { bytes: 0 },
+                    network: NetworkCapability { bits_per_second: 0 },
+                    reliability: Reliability { availability: 1.0 },
+                    latency: Latency {
+                        to_participant: Duration::from_millis(1),
+                    },
+                    lifetime: Lifetime {
+                        duration: Some(lifetime),
+                    },
+                    security: Security { trusted: true },
+                },
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 2.0 },
+                    lifetime: Some(lifetime),
+                    ..Default::default()
+                },
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        participant
+            .activate(SystemTime::UNIX_EPOCH + Duration::from_secs(2))
+            .unwrap();
+        plane.register_participant(participant).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (_, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].expires_at.duration_since(created_at).unwrap(), lifetime);
+        assert_eq!(leases[0].resources.lifetime, Some(lifetime));
+    }
+
+    #[test]
+    fn invalid_runtime_does_not_create_or_leak_leases() {
+        let plane = plane();
+        plane.register_participant(active_participant()).unwrap();
+
+        let result = plane.create_leased_logical_node_with_runtime(
+            ResourceFragment {
+                cpu: crate::resource::Cpu { cores: 1.0 },
+                ..Default::default()
+            },
+            RuntimeSpec::new("", "1"),
+            SystemTime::now(),
+            Duration::from_secs(60),
+        );
+
+        assert_eq!(result.unwrap_err(), ControlError::Node(NodeError::EmptyRuntimeName));
+        assert!(plane.list_leases().is_empty());
+    }
+
+    #[test]
     fn control_plane_creates_vm_from_owned_leases() {
         let plane = plane();
         let participant = active_participant();
