@@ -275,9 +275,11 @@ mod tests {
     fn vm_binds_to_matching_leases() {
         let node = node();
         let created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
-        let participant_id =
-            Identity::parse(&node.resources.allocations[0].participant_id, Kind::Participant)
-                .unwrap();
+        let participant_id = Identity::parse(
+            &node.resources.allocations[0].participant_id,
+            Kind::Participant,
+        )
+        .unwrap();
         let node_id = Identity::parse(&node.id, Kind::LogicalNode).unwrap();
         let lease = Lease::new(
             Identity::new(Kind::Lease),
@@ -302,8 +304,11 @@ mod tests {
         let lease = Lease::new(
             Identity::new(Kind::Lease),
             Identity::new(Kind::LogicalNode),
-            Identity::parse(&node.resources.allocations[0].participant_id, Kind::Participant)
-                .unwrap(),
+            Identity::parse(
+                &node.resources.allocations[0].participant_id,
+                Kind::Participant,
+            )
+            .unwrap(),
             node.resources.allocations[0].resources,
             created_at,
             created_at + std::time::Duration::from_secs(60),
@@ -320,9 +325,11 @@ mod tests {
     fn vm_rejects_expired_lease_at_execution_time() {
         let node = node();
         let created_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
-        let participant_id =
-            Identity::parse(&node.resources.allocations[0].participant_id, Kind::Participant)
-                .unwrap();
+        let participant_id = Identity::parse(
+            &node.resources.allocations[0].participant_id,
+            Kind::Participant,
+        )
+        .unwrap();
         let node_id = Identity::parse(&node.id, Kind::LogicalNode).unwrap();
         let lease = Lease::new(
             Identity::new(Kind::Lease),
@@ -474,8 +481,8 @@ mod tests {
         use crate::execution::ExecutionDispatcher;
         use crate::runtime::{Runtime, RuntimeContext, RuntimeError, RuntimeRegistry};
         use crate::transport::{EndpointTransport, ExecutionEndpoint};
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Debug)]
         struct CountingRuntime {
@@ -624,10 +631,7 @@ mod tests {
 
         let mut registry = RuntimeRegistry::default();
         registry
-            .register(
-                RuntimeSpec::new("wasm", "1"),
-                Arc::new(FailingRuntime),
-            )
+            .register(RuntimeSpec::new("wasm", "1"), Arc::new(FailingRuntime))
             .unwrap();
         let registry = Arc::new(registry);
 

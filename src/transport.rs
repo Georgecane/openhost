@@ -360,22 +360,24 @@ impl TcpEndpointServer {
             let endpoint = Arc::clone(&self.endpoint);
             let tls_config = self.tls_config.clone();
             let authorized_clients = self.authorized_clients.clone();
-            workers.push(std::thread::spawn(move || loop {
-                let stream = {
-                    let Ok(receiver) = receiver.lock() else {
-                        return;
+            workers.push(std::thread::spawn(move || {
+                loop {
+                    let stream = {
+                        let Ok(receiver) = receiver.lock() else {
+                            return;
+                        };
+                        match receiver.recv() {
+                            Ok(stream) => stream,
+                            Err(_) => return,
+                        }
                     };
-                    match receiver.recv() {
-                        Ok(stream) => stream,
-                        Err(_) => return,
-                    }
-                };
-                let _ = handle_connection(
-                    stream,
-                    Arc::clone(&endpoint),
-                    tls_config.clone(),
-                    authorized_clients.clone(),
-                );
+                    let _ = handle_connection(
+                        stream,
+                        Arc::clone(&endpoint),
+                        tls_config.clone(),
+                        authorized_clients.clone(),
+                    );
+                }
             }));
         }
 
@@ -706,7 +708,10 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
 const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
 const PROTOCOL_VERSION: u8 = 1;
 
-fn write_request<S: Write>(stream: &mut S, request: &ExecutionRequest) -> Result<(), TransportError> {
+fn write_request<S: Write>(
+    stream: &mut S,
+    request: &ExecutionRequest,
+) -> Result<(), TransportError> {
     let mut payload = Vec::new();
     payload.push(PROTOCOL_VERSION);
     write_string(&mut payload, &request.request_id)?;
@@ -940,8 +945,7 @@ impl<'a> Reader<'a> {
 
     fn string(&mut self) -> Result<String, TransportError> {
         let length = self.u32()? as usize;
-        String::from_utf8(self.take(length)?.to_vec())
-            .map_err(|_| TransportError::MalformedFrame)
+        String::from_utf8(self.take(length)?.to_vec()).map_err(|_| TransportError::MalformedFrame)
     }
 
     fn bytes(&mut self) -> Result<Vec<u8>, TransportError> {
@@ -1232,7 +1236,6 @@ mod tests {
         assert!(transport.is_empty());
     }
 
-
     #[test]
     fn tcp_transport_executes_through_real_socket() {
         let participant_id = Identity::new(Kind::Participant);
@@ -1249,18 +1252,13 @@ mod tests {
         let server_thread = std::thread::spawn(move || server.serve_once());
         let mut request = request();
         request.unit.participant_id = participant_id.clone();
-        request.endpoint = ExecutionEndpoint::new(
-            participant_id,
-            address.to_string(),
-        )
-        .unwrap();
+        request.endpoint = ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
 
         let response = TcpTransport::new().dispatch(request).unwrap();
         assert_eq!(response.status, ExecutionStatus::Completed);
         assert!(response.error.is_none());
         server_thread.join().unwrap().unwrap();
     }
-
 
     #[test]
     fn tcp_server_shuts_down_cleanly_and_restores_listener_mode() {
@@ -1280,9 +1278,8 @@ mod tests {
         let server_for_thread = server.clone();
         let shutdown_for_thread = Arc::clone(&shutdown);
 
-        let server_thread = std::thread::spawn(move || {
-            server_for_thread.serve_until(&shutdown_for_thread)
-        });
+        let server_thread =
+            std::thread::spawn(move || server_for_thread.serve_until(&shutdown_for_thread));
 
         std::thread::sleep(Duration::from_millis(30));
         shutdown.store(true, Ordering::Release);
@@ -1294,8 +1291,7 @@ mod tests {
         let request_thread = std::thread::spawn(move || server_for_request.serve_once());
         let mut request = request();
         request.unit.participant_id = participant_id.clone();
-        request.endpoint =
-            ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+        request.endpoint = ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
         let response = TcpTransport::new().dispatch(request).unwrap();
 
         assert_eq!(response.status, ExecutionStatus::Completed);
@@ -1319,8 +1315,7 @@ mod tests {
                 std::env::temp_dir().join(format!("openhost-tls-test-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&directory).unwrap();
 
-            let server = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
-                .unwrap();
+            let server = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
             let client =
                 rcgen::generate_simple_self_signed(vec!["openhost-client".to_owned()]).unwrap();
             let untrusted_client =
@@ -1400,8 +1395,7 @@ mod tests {
         let mut request = request();
         request.source_participant_id = Some(source_participant_id);
         request.unit.participant_id = participant_id.clone();
-        request.endpoint =
-            ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+        request.endpoint = ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
 
         let response = transport.dispatch(request).unwrap();
         assert_eq!(response.status, ExecutionStatus::Completed);
@@ -1413,8 +1407,7 @@ mod tests {
     fn mtls_client_rejects_server_certificate_name_mismatch() {
         let files = TlsTestFiles::new();
         let wrong_server =
-            rcgen::generate_simple_self_signed(vec!["not-the-server.example".to_owned()])
-                .unwrap();
+            rcgen::generate_simple_self_signed(vec!["not-the-server.example".to_owned()]).unwrap();
         let wrong_server_certificate = files.directory.join("wrong-server-cert.pem");
         let wrong_server_key = files.directory.join("wrong-server-key.pem");
         std::fs::write(&wrong_server_certificate, wrong_server.cert.pem()).unwrap();
@@ -1481,11 +1474,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let grant = AuthorizedClientCertificate::from_pem(
-            authorized_source_id,
-            &files.client_certificate,
-        )
-        .unwrap();
+        let grant =
+            AuthorizedClientCertificate::from_pem(authorized_source_id, &files.client_certificate)
+                .unwrap();
         let server = TcpEndpointServer::bind_mtls(
             "127.0.0.1:0",
             endpoint,
@@ -1558,8 +1549,7 @@ mod tests {
         let mut request = request();
         request.source_participant_id = Some(source_participant_id);
         request.unit.participant_id = participant_id.clone();
-        request.endpoint =
-            ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+        request.endpoint = ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
 
         let client_result = transport.dispatch(request);
         assert!(matches!(
@@ -1591,7 +1581,8 @@ mod tests {
         let mut first = request();
         first.request_id = "concurrent-1".into();
         first.unit.participant_id = participant_id.clone();
-        first.endpoint = ExecutionEndpoint::new(participant_id.clone(), address.to_string()).unwrap();
+        first.endpoint =
+            ExecutionEndpoint::new(participant_id.clone(), address.to_string()).unwrap();
 
         let mut second = first.clone();
         second.request_id = "concurrent-2".into();
@@ -1624,7 +1615,10 @@ mod tests {
                 &self,
                 request: ExecutionRequest,
             ) -> Result<ExecutionResponse, crate::endpoint::EndpointError> {
-                Ok(ExecutionResponse::completed(format!("{}-wrong", request.request_id)))
+                Ok(ExecutionResponse::completed(format!(
+                    "{}-wrong",
+                    request.request_id
+                )))
             }
         }
 
@@ -1638,8 +1632,7 @@ mod tests {
 
         let mut request = request();
         request.unit.participant_id = participant_id.clone();
-        request.endpoint =
-            ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+        request.endpoint = ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
 
         assert_eq!(
             TcpTransport::new().dispatch(request).unwrap_err(),
@@ -1706,7 +1699,10 @@ mod tests {
 
         let mut stream = TcpStream::connect(address).unwrap();
         configure_stream(&stream).unwrap();
-        assert_eq!(read_response(&mut stream).unwrap_err(), TransportError::MalformedFrame);
+        assert_eq!(
+            read_response(&mut stream).unwrap_err(),
+            TransportError::MalformedFrame
+        );
         server_thread.join().unwrap();
     }
 

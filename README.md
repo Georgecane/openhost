@@ -129,6 +129,46 @@ The endpoint locator must contain a hostname or IP address and port. That hostna
 
 **Certificate management remains the operator's responsibility.** Keep private keys out of source control and rotate/revoke certificates through your CA process. mTLS validates the certificate chain; the explicit grant additionally ensures a caller cannot claim a different participant ID using a certificate assigned to another identity. This implementation does not yet provide automated certificate issuance, revocation distribution, or a cluster-wide trust-policy control plane.
 
+## Discovery and network beacons
+
+Participants can broadcast their capabilities and resource availability using UDP beacons:
+
+- `DiscoveryBeacon` periodically broadcasts binary-encoded `Advertisement` frames over UDP.
+- `DiscoveryListener` listens for incoming discovery datagrams, verifies wire protocol version 1, and populates the discovery `Registry` with real-time freshness tracking (`Active` → `Stale` → `Expired`).
+
+## Execution runtimes
+
+OpenHost provides built-in concrete runtime engines:
+
+- `ProcessRuntime`: executes external processes specified by `ProcessCommand` with args, environment variables, optional command allowlisting, and bounded timeouts.
+- `EchoRuntime`: lightweight validation runtime for connectivity and integration verification.
+
+## Fault tolerance and node healing
+
+When a participant experiences churn, drains, or disconnects during execution:
+
+- `audit_virtual_machine_health`: checks active VM leases against local registry state, expiration, and discovery status.
+- `heal_virtual_machine`: dynamic reallocation that locates an alternative active participant offer in the fabric, releases the failed participant's lease, issues a replacement lease, and recomposes the `LogicalNode` capacity without tearing down the VM.
+
+## CLI commands
+
+The `openhost` CLI supports multiple operational modes:
+
+```bash
+# Run in-memory scheduling and resource allocation demo
+cargo run --bin openhost -- demo
+
+# Compute a multi-participant allocation plan
+cargo run --bin openhost -- plan --cpu 2.5 --memory-mb 1024
+
+# Launch participant daemon listening on TCP and broadcasting discovery beacon
+cargo run --bin openhost -- participant --bind 127.0.0.1:7443 --cpu 4.0 --memory-mb 2048 --beacon 127.0.0.1:7444
+
+# Dispatch execution to a participant endpoint
+cargo run --bin openhost -- exec --endpoint 127.0.0.1:7443 --runtime echo
+cargo run --bin openhost -- exec --endpoint 127.0.0.1:7443 --runtime process --program true
+```
+
 ## Development
 
 Requires a current stable Rust toolchain.

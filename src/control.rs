@@ -1,5 +1,8 @@
 use crate::discovery::{Advertisement, Member, Registry as DiscoveryRegistry};
-use crate::execution::{ExecutionBackend, ExecutionError, ExecutionPlan, ExecutionReceipt, WorkItem};
+use crate::execution::{
+    ExecutionBackend, ExecutionError, ExecutionPlan, ExecutionReceipt, WorkItem,
+};
+use crate::fabric::Fabric;
 use crate::identity::{Identity, Kind};
 use crate::lease::Lease;
 use crate::node::{LogicalNode, NodeError, RuntimeSpec};
@@ -18,6 +21,8 @@ pub enum ControlError {
     InvalidLeaseDuration,
     LeaseNotFound,
     VirtualMachineNotFound,
+    ParticipantNotFound,
+    ParticipantNotAllocated,
     Scheduler(SchedulerError),
     Node(NodeError),
     Execution(ExecutionError),
@@ -114,9 +119,16 @@ impl Plane {
         node: &LogicalNode,
         created_at: SystemTime,
     ) -> Result<VirtualMachine, ControlError> {
-        let vm = VirtualMachine::from_node(node, created_at).map_err(ControlError::VirtualMachine)?;
-        self.logical_nodes.write().expect("logical node registry lock poisoned").insert(node.id.clone(), node.clone());
-        self.virtual_machines.write().expect("virtual machine registry lock poisoned").insert(vm.id.id.clone(), vm.clone());
+        let vm =
+            VirtualMachine::from_node(node, created_at).map_err(ControlError::VirtualMachine)?;
+        self.logical_nodes
+            .write()
+            .expect("logical node registry lock poisoned")
+            .insert(node.id.clone(), node.clone());
+        self.virtual_machines
+            .write()
+            .expect("virtual machine registry lock poisoned")
+            .insert(vm.id.id.clone(), vm.clone());
         Ok(vm)
     }
 
@@ -136,8 +148,14 @@ impl Plane {
 
         match VirtualMachine::from_leased_node(&node, leases.clone(), created_at) {
             Ok(vm) => {
-                self.logical_nodes.write().expect("logical node registry lock poisoned").insert(node.id.clone(), node.clone());
-                self.virtual_machines.write().expect("virtual machine registry lock poisoned").insert(vm.id.id.clone(), vm.clone());
+                self.logical_nodes
+                    .write()
+                    .expect("logical node registry lock poisoned")
+                    .insert(node.id.clone(), node.clone());
+                self.virtual_machines
+                    .write()
+                    .expect("virtual machine registry lock poisoned")
+                    .insert(vm.id.id.clone(), vm.clone());
                 Ok((vm, leases))
             }
             Err(error) => {
@@ -235,6 +253,149 @@ impl Plane {
             .insert(vm.id.id.clone(), vm);
 
         result.map_err(ControlError::VirtualMachine)
+    }
+
+    pub fn audit_virtual_machine_health(
+        &self,
+        id: &Identity,
+        now: SystemTime,
+    ) -> Result<Vec<Identity>, ControlError> {
+        let vm = self.get_virtual_machine(id)?;
+        let mut unhealthy = Vec::new();
+
+        for lease in &vm.leases {
+            if !lease.active_at(now) {
+                unhealthy.push(lease.participant_id.clone());
+                continue;
+            }
+
+            if let Ok(participant) = self.registry.get(&lease.participant_id) {
+                let snapshot = participant.snapshot();
+                if snapshot.state != crate::participant::State::Active {
+                    unhealthy.push(lease.participant_id.clone());
+                }
+            } else if let Ok(members) = self.discovery.members_at(now)
+                && members.iter().any(|(m, state)| {
+                    m.advertisement.participant == lease.participant_id
+                        && *state == crate::discovery::State::Expired
+                })
+            {
+                unhealthy.push(lease.participant_id.clone());
+            }
+        }
+
+        Ok(unhealthy)
+    }
+
+    pub fn heal_virtual_machine(
+        &self,
+        vm_id: &Identity,
+        failed_participant_id: &Identity,
+        now: SystemTime,
+        lease_duration: Duration,
+    ) -> Result<(VirtualMachine, Lease), ControlError> {
+        if now == SystemTime::UNIX_EPOCH {
+            return Err(ControlError::InvalidTime);
+        }
+        if lease_duration.is_zero() {
+            return Err(ControlError::InvalidLeaseDuration);
+        }
+
+        let mut vm = self.get_virtual_machine(vm_id)?;
+        let mut node = self
+            .logical_nodes
+            .read()
+            .expect("logical node registry lock poisoned")
+            .get(&vm.node_id.id)
+            .cloned()
+            .ok_or(ControlError::VirtualMachineNotFound)?;
+
+        let alloc_idx = node
+            .resources
+            .allocations
+            .iter()
+            .position(|a| a.participant_id == failed_participant_id.id)
+            .ok_or(ControlError::ParticipantNotAllocated)?;
+
+        let needed_resources = node.resources.allocations[alloc_idx].resources;
+
+        let existing_participants: std::collections::HashSet<_> = node
+            .resources
+            .allocations
+            .iter()
+            .map(|a| a.participant_id.clone())
+            .collect();
+
+        let offers = self.registry.offers();
+        let replacement_offer = offers
+            .into_iter()
+            .find(|offer| {
+                !existing_participants.contains(&offer.participant_id)
+                    && offer.resources.satisfies(&needed_resources)
+            })
+            .ok_or(ControlError::Scheduler(
+                SchedulerError::InsufficientResources,
+            ))?;
+
+        let replacement_participant_id =
+            Identity::parse(&replacement_offer.participant_id, Kind::Participant)
+                .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
+
+        if let Some(old_lease_idx) = vm
+            .leases
+            .iter()
+            .position(|l| l.participant_id == *failed_participant_id)
+        {
+            let old_lease = vm.leases.remove(old_lease_idx);
+            let _ = self.release_lease(&old_lease.id);
+        }
+
+        let mut resources = needed_resources;
+        if resources.lifetime.is_none_or(|l| l > lease_duration) {
+            resources.lifetime = Some(lease_duration);
+        }
+
+        let new_lease = Lease::new(
+            Identity::new(Kind::Lease),
+            vm.node_id.clone(),
+            replacement_participant_id.clone(),
+            resources,
+            now,
+            now + lease_duration,
+        )
+        .map_err(|_| ControlError::Scheduler(SchedulerError::InsufficientResources))?;
+
+        self.leases
+            .write()
+            .expect("lease registry lock poisoned")
+            .insert(new_lease.id.id.clone(), new_lease.clone());
+
+        node.resources.allocations[alloc_idx] = crate::resource::Allocation {
+            participant_id: replacement_participant_id.id.clone(),
+            resources,
+        };
+
+        let new_resources =
+            crate::resource::CompositeResource::compose(node.resources.allocations.clone())
+                .map_err(|_| ControlError::Scheduler(SchedulerError::InvalidOffer))?;
+        node.resources = new_resources;
+
+        vm.leases.push(new_lease.clone());
+        if vm.state == crate::virtual_machine::VirtualMachineState::Failed {
+            vm.state = crate::virtual_machine::VirtualMachineState::Running;
+        }
+
+        self.logical_nodes
+            .write()
+            .expect("logical node registry lock poisoned")
+            .insert(node.id.clone(), node);
+
+        self.virtual_machines
+            .write()
+            .expect("virtual machine registry lock poisoned")
+            .insert(vm.id.id.clone(), vm.clone());
+
+        Ok((vm, new_lease))
     }
 
     pub fn release_lease(&self, id: &Identity) -> Result<Lease, ControlError> {
@@ -363,7 +524,6 @@ impl Plane {
         Ok((node, leases))
     }
 
-
     pub fn get_lease(&self, id: &Identity) -> Result<Lease, ControlError> {
         if id.kind != Kind::Lease || id.validate().is_err() {
             return Err(ControlError::LeaseNotFound);
@@ -441,7 +601,9 @@ mod leased_vm_tests {
     fn control_plane_creates_vm_from_owned_leases() {
         let plane = plane();
         let participant = active_participant();
-        plane.register_participant(Arc::clone(&participant)).unwrap();
+        plane
+            .register_participant(Arc::clone(&participant))
+            .unwrap();
 
         let created_at = SystemTime::now();
         let (vm, leases) = plane
@@ -462,7 +624,6 @@ mod leased_vm_tests {
             assert_eq!(plane.get_lease(&lease.id).unwrap(), *lease);
         }
     }
-
 
     #[test]
     fn control_plane_owns_virtual_machine_lifecycle() {
@@ -485,14 +646,20 @@ mod leased_vm_tests {
         assert_eq!(plane.get_virtual_machine(&vm.id).unwrap(), vm);
 
         let started = plane.start_virtual_machine(&vm.id).unwrap();
-        assert_eq!(started.state, crate::virtual_machine::VirtualMachineState::Running);
+        assert_eq!(
+            started.state,
+            crate::virtual_machine::VirtualMachineState::Running
+        );
         assert_eq!(
             plane.get_virtual_machine(&vm.id).unwrap().state,
             crate::virtual_machine::VirtualMachineState::Running
         );
 
         let stopped = plane.stop_virtual_machine(&vm.id).unwrap();
-        assert_eq!(stopped.state, crate::virtual_machine::VirtualMachineState::Stopped);
+        assert_eq!(
+            stopped.state,
+            crate::virtual_machine::VirtualMachineState::Stopped
+        );
 
         let destroyed = plane.destroy_virtual_machine(&vm.id).unwrap();
         assert_eq!(destroyed.id, vm.id);
@@ -514,19 +681,33 @@ mod leased_vm_tests {
         let plane = plane();
         plane.register_participant(active_participant()).unwrap();
         let created_at = SystemTime::now();
-        let (vm, _) = plane.create_leased_virtual_machine(
-            ResourceFragment { cpu: crate::resource::Cpu { cores: 1.0 }, ..Default::default() },
-            RuntimeSpec::new("wasm", "1"), created_at, Duration::from_secs(60),
-        ).unwrap();
+        let (vm, _) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
         plane.start_virtual_machine(&vm.id).unwrap();
-        let workload = WorkItem { id: "control-plane-workload".into(), payload: vec![1,2,3] };
-        let receipt = plane.execute_virtual_machine(&vm.id, &workload, &crate::execution::NoopBackend).unwrap();
+        let workload = WorkItem {
+            id: "control-plane-workload".into(),
+            payload: vec![1, 2, 3],
+        };
+        let receipt = plane
+            .execute_virtual_machine(&vm.id, &workload, &crate::execution::NoopBackend)
+            .unwrap();
         assert_eq!(receipt.workload_id, workload.id);
         assert_eq!(receipt.node_id, vm.node_id);
         assert_eq!(receipt.dispatched_units, 1);
-        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap().state, crate::virtual_machine::VirtualMachineState::Running);
+        assert_eq!(
+            plane.get_virtual_machine(&vm.id).unwrap().state,
+            crate::virtual_machine::VirtualMachineState::Running
+        );
     }
-
 
     #[test]
     fn control_plane_lookup_does_not_wait_for_execution() {
@@ -584,8 +765,9 @@ mod leased_vm_tests {
 
         let execute_plane = Arc::clone(&plane);
         let execute_id = vm.id.clone();
-        let execute_handle =
-            thread::spawn(move || execute_plane.execute_virtual_machine(&execute_id, &workload, &backend));
+        let execute_handle = thread::spawn(move || {
+            execute_plane.execute_virtual_machine(&execute_id, &workload, &backend)
+        });
 
         started.wait();
 
@@ -593,7 +775,8 @@ mod leased_vm_tests {
         let lookup_plane = Arc::clone(&plane);
         let lookup_id = vm.id.clone();
         thread::spawn(move || {
-            tx.send(lookup_plane.get_virtual_machine(&lookup_id)).unwrap();
+            tx.send(lookup_plane.get_virtual_machine(&lookup_id))
+                .unwrap();
         });
 
         let visible_vm = rx
@@ -737,13 +920,27 @@ mod leased_vm_tests {
         let plane = plane();
         plane.register_participant(active_participant()).unwrap();
         let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        let (vm, _) = plane.create_leased_virtual_machine(
-            ResourceFragment { cpu: crate::resource::Cpu { cores: 1.0 }, ..Default::default() },
-            RuntimeSpec::new("wasm", "1"), created_at, Duration::from_secs(60),
-        ).unwrap();
-        let workload = WorkItem { id: "stopped-workload".into(), payload: Vec::new() };
-        assert_eq!(plane.execute_virtual_machine(&vm.id, &workload, &crate::execution::NoopBackend).unwrap_err(),
-            ControlError::VirtualMachine(VirtualMachineError::NotRunning));
+        let (vm, _) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+        let workload = WorkItem {
+            id: "stopped-workload".into(),
+            payload: Vec::new(),
+        };
+        assert_eq!(
+            plane
+                .execute_virtual_machine(&vm.id, &workload, &crate::execution::NoopBackend)
+                .unwrap_err(),
+            ControlError::VirtualMachine(VirtualMachineError::NotRunning)
+        );
     }
 
     #[test]
@@ -751,22 +948,45 @@ mod leased_vm_tests {
         #[derive(Debug, Clone, Copy)]
         struct FailingBackend;
         impl ExecutionBackend for FailingBackend {
-            fn execute(&self, _: &ExecutionPlan, _: &WorkItem) -> Result<ExecutionReceipt, ExecutionError> {
+            fn execute(
+                &self,
+                _: &ExecutionPlan,
+                _: &WorkItem,
+            ) -> Result<ExecutionReceipt, ExecutionError> {
                 Err(ExecutionError::BackendRejected)
             }
         }
         let plane = plane();
         plane.register_participant(active_participant()).unwrap();
         let created_at = SystemTime::now();
-        let (vm, _) = plane.create_leased_virtual_machine(
-            ResourceFragment { cpu: crate::resource::Cpu { cores: 1.0 }, ..Default::default() },
-            RuntimeSpec::new("wasm", "1"), created_at, Duration::from_secs(60),
-        ).unwrap();
+        let (vm, _) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
         plane.start_virtual_machine(&vm.id).unwrap();
-        let workload = WorkItem { id: "failed-workload".into(), payload: Vec::new() };
-        assert_eq!(plane.execute_virtual_machine(&vm.id, &workload, &FailingBackend).unwrap_err(),
-            ControlError::VirtualMachine(VirtualMachineError::Execution(ExecutionError::BackendRejected)));
-        assert_eq!(plane.get_virtual_machine(&vm.id).unwrap().state, crate::virtual_machine::VirtualMachineState::Failed);
+        let workload = WorkItem {
+            id: "failed-workload".into(),
+            payload: Vec::new(),
+        };
+        assert_eq!(
+            plane
+                .execute_virtual_machine(&vm.id, &workload, &FailingBackend)
+                .unwrap_err(),
+            ControlError::VirtualMachine(VirtualMachineError::Execution(
+                ExecutionError::BackendRejected
+            ))
+        );
+        assert_eq!(
+            plane.get_virtual_machine(&vm.id).unwrap().state,
+            crate::virtual_machine::VirtualMachineState::Failed
+        );
     }
 
     #[test]
@@ -796,5 +1016,64 @@ mod leased_vm_tests {
                 ControlError::LeaseNotFound
             );
         }
+    }
+
+    #[test]
+    fn control_plane_audits_unhealthy_participants_and_heals_vm() {
+        let plane = plane();
+        let p1 = active_participant();
+        let p2 = active_participant();
+        let p1_id = p1.snapshot().id;
+        let p2_id = p2.snapshot().id;
+
+        plane.register_participant(Arc::clone(&p1)).unwrap();
+
+        let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let (vm, leases) = plane
+            .create_leased_virtual_machine(
+                ResourceFragment {
+                    cpu: crate::resource::Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+                RuntimeSpec::new("wasm", "1"),
+                created_at,
+                Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].participant_id, p1_id);
+
+        // p1 drains (becomes unhealthy)
+        p1.drain(created_at + Duration::from_secs(10)).unwrap();
+
+        // Audit finds p1 unhealthy
+        let unhealthy = plane
+            .audit_virtual_machine_health(&vm.id, created_at + Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(unhealthy, vec![p1_id.clone()]);
+
+        // Register replacement participant p2
+        plane.register_participant(Arc::clone(&p2)).unwrap();
+
+        // Heal the VM by replacing p1 with p2
+        let (healed_vm, new_lease) = plane
+            .heal_virtual_machine(
+                &vm.id,
+                &p1_id,
+                created_at + Duration::from_secs(10),
+                Duration::from_secs(50),
+            )
+            .unwrap();
+
+        assert_eq!(new_lease.participant_id, p2_id);
+        assert_eq!(healed_vm.leases.len(), 1);
+        assert_eq!(healed_vm.leases[0].participant_id, p2_id);
+
+        // Audit now reports healthy
+        let unhealthy_after = plane
+            .audit_virtual_machine_health(&vm.id, created_at + Duration::from_secs(10))
+            .unwrap();
+        assert!(unhealthy_after.is_empty());
     }
 }

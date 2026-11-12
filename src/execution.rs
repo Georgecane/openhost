@@ -431,11 +431,8 @@ mod tests {
             .map(|allocation| {
                 let participant_id =
                     Identity::parse(&allocation.participant_id, Kind::Participant).unwrap();
-                crate::transport::ExecutionEndpoint::new(
-                    participant_id,
-                    "loopback://participant",
-                )
-                .unwrap()
+                crate::transport::ExecutionEndpoint::new(participant_id, "loopback://participant")
+                    .unwrap()
             })
             .collect();
         ExecutionDispatcher::new(StatusTransport(status), endpoints)
@@ -449,10 +446,8 @@ mod tests {
             fn dispatch(
                 &self,
                 request: crate::transport::ExecutionRequest,
-            ) -> Result<
-                crate::transport::ExecutionResponse,
-                crate::transport::TransportError,
-            > {
+            ) -> Result<crate::transport::ExecutionResponse, crate::transport::TransportError>
+            {
                 assert_eq!(
                     request.source_participant_id.as_ref(),
                     Some(&self.0),
@@ -512,7 +507,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn dispatcher_dispatches_units_concurrently() {
         use std::sync::{Arc, Barrier};
@@ -526,9 +520,12 @@ mod tests {
             fn dispatch(
                 &self,
                 request: crate::transport::ExecutionRequest,
-            ) -> Result<crate::transport::ExecutionResponse, crate::transport::TransportError> {
+            ) -> Result<crate::transport::ExecutionResponse, crate::transport::TransportError>
+            {
                 self.barrier.wait();
-                Ok(crate::transport::ExecutionResponse::completed(request.request_id))
+                Ok(crate::transport::ExecutionResponse::completed(
+                    request.request_id,
+                ))
             }
         }
 
@@ -547,8 +544,7 @@ mod tests {
                 .clone(),
         );
 
-        let result = std::thread::spawn(move || dispatcher.dispatch(&plan, &workload))
-            .join();
+        let result = std::thread::spawn(move || dispatcher.dispatch(&plan, &workload)).join();
 
         assert!(
             result.is_ok(),
