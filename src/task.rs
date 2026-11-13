@@ -196,9 +196,15 @@ impl RegistryPersistence {
             .write(true)
             .open(lock_path)
             .map_err(|_| TaskError::PersistenceUnavailable)?;
-        lock_file
-            .try_lock()
-            .map_err(|_| TaskError::RegistryAlreadyOpen)?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(TaskError::RegistryAlreadyOpen);
+            }
+            Err(std::fs::TryLockError::Error(_)) => {
+                return Err(TaskError::PersistenceUnavailable);
+            }
+        }
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -293,8 +299,8 @@ impl TaskRegistry {
 
     /// Open or create a durable registry journal.
     ///
-    /// Every state transition is appended as a versioned full-state snapshot and fsynced before
-    /// becoming visible to callers. An unfinished trailing journal record is discarded on
+    /// Every state transition is appended as a versioned event containing only changed task
+    /// records and synced before becoming visible to callers. An unfinished trailing event is discarded on
     /// recovery. The lock file prevents two independent registry owners from writing the same
     /// journal concurrently.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TaskError> {
@@ -1047,8 +1053,6 @@ mod tests {
 
     #[test]
     fn durable_registry_discards_only_an_incomplete_trailing_record() {
-        use std::io::Write;
-
         let path = temp_registry_path("durable-tail");
         let (task, _) = job("tail-workload");
         let registry = TaskRegistry::open(&path).unwrap();
