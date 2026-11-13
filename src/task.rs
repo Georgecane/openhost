@@ -214,7 +214,7 @@ impl RegistryPersistence {
         // append and is discarded; malformed complete lines are treated as corruption.
         let valid_len = bytes
             .iter()
-            .rposition(|byte| *byte == b'\\n')
+            .rposition(|byte| *byte == b'\n')
             .map_or(0, |index| index + 1);
         if valid_len != bytes.len() {
             file.set_len(valid_len as u64)
@@ -225,7 +225,7 @@ impl RegistryPersistence {
         }
 
         let mut store = TaskStore::default();
-        for line in bytes.split(|byte| *byte == b'\\n').filter(|line| !line.is_empty()) {
+        for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
             let snapshot: PersistedRegistrySnapshot =
                 serde_json::from_slice(line).map_err(|_| TaskError::CorruptRegistry)?;
             store = snapshot.into_store()?;
@@ -256,7 +256,7 @@ impl RegistryPersistence {
         let append_result = (|| -> std::io::Result<()> {
             self.file.seek(SeekFrom::End(0))?;
             self.file.write_all(&bytes)?;
-            self.file.write_all(b"\\n")?;
+            self.file.write_all(b"\n")?;
             self.file.sync_data()
         })();
 
@@ -1049,7 +1049,7 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap();
-        file.write_all(b"{\\"schema_version\\":")
+        file.write_all(b"{\"schema_version\":")
             .unwrap();
         file.sync_all().unwrap();
         drop(file);
