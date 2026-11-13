@@ -171,24 +171,9 @@ ExecutionEngine accepts a batch of independent workloads. It expands each worklo
 
 The engine supports two execution modes. The batch API fans each complete workload out to participant units. The partitioned API accepts application-defined WorkloadPartition values, places them deterministically across participant units, sends each participant only its assigned partition, collects result bytes, and returns them ordered by partition index. A caller-supplied PartitionReducer defines how those results become an application result.
 
-OpenHost deliberately does **not** split opaque payload bytes automatically: partition boundaries and computation semantics belong to the application. The current placement policy is round-robin, not yet resource-weighted or topology-aware. Dependency graphs, retry/idempotency, cancellation/deadlines, durable execution state, and shared virtual memory are still future work.
+OpenHost deliberately does **not** split opaque payload bytes automatically: partition boundaries and computation semantics belong to the application. The current placement policy is round-robin, not yet resource-weighted or topology-aware. Dependency graphs, deadlines, cooperative cancellation, replicated state, participant-side deduplication, and shared virtual memory are still future work.
 
 The worker pool is persistent for the lifetime of an ExecutionEngine instance. It bounds simultaneous outbound participant requests across concurrent batch submissions, and its bounded queue applies backpressure rather than creating one operating-system thread per allocation or batch. By default, the limit is per engine instance. An optional, cloneable `AdmissionController` can be injected into multiple engines and task managers to enforce one shared active-request limit with a bounded FIFO waiter queue inside the coordinator process. The per-engine worker limit remains an additional local bound. This is not a cross-process or cross-host admission service; a multi-machine Fabric will need a networked coordinator or lease-based capacity protocol.
-
-## 14. Durable task registry and coordinator recovery
-
-The task registry has two storage modes:
-
-- `TaskRegistry::new()` is process-local and memory-only.
-- `TaskRegistry::open(path)` opens a durable append-only journal. Task submissions, state transitions, retry counters, errors, and completed outputs are recorded before the updated state is returned to the caller.
-
-Each journal record is a versioned event containing only the task records changed by that operation. The journal is replayed in order at startup. A final record without its newline terminator is treated as an interrupted append and discarded; a malformed complete record or unsupported schema version fails startup rather than silently losing state. Each append is flushed with `sync_data`.
-
-A sidecar file lock enforces one independent writer per journal path. Multiple TaskManagers in one process should share cloned handles to the same `TaskRegistry`; opening the same path independently is rejected. This file-backed registry is a single-coordinator persistence mechanism, not a replicated multi-host database.
-
-On startup, tasks found in `Dispatched` or `Running` are moved to `Failed` with an explicit unknown-remote-outcome error. They are never automatically replayed because a participant may have completed side effects before the coordinator stopped. An operator or caller must inspect and explicitly retry; execution remains at-least-once until participant-side deduplication is available.
-
-The journal currently has no compaction or retention policy. It is appropriate as a first durable coordinator backend, not yet a high-volume long-running storage service. Future work includes journal compaction, replicated metadata, coordinator election/leases, and network-visible admission control.
 
 ## 13. Task lifecycle (coordinator lifecycle)
 
@@ -204,7 +189,22 @@ Pending → Dispatched → Running → Completed
 
 The first attempt is numbered 1. Retry is an explicit operation, increments the attempt number, and is bounded by max_attempts. Cancellation is currently supported only while a task is Pending; it does not interrupt work already running. A successful task record stores either its workload receipt or its partition outputs.
 
-This registry is process-local and memory-only. A process restart loses task records and results. Retries are at-least-once: if a participant performed a side effect but its response was lost, a retry may repeat that work. Side-effecting runtimes must implement their own idempotency until task/attempt identity is propagated to durable participant-side deduplication. Exactly-once execution is not claimed.
+The default registry is process-local and memory-only. The durable `TaskRegistry::open(path)` backend preserves task records and results across coordinator restarts. Retries are at-least-once: if a participant performed a side effect but its response was lost, a retry may repeat that work. Side-effecting runtimes must implement their own idempotency until task/attempt identity is propagated to participant-side deduplication. Exactly-once execution is not claimed.
+
+## 14. Durable task registry and coordinator recovery
+
+The task registry has two storage modes:
+
+- `TaskRegistry::new()` is process-local and memory-only.
+- `TaskRegistry::open(path)` opens a durable append-only journal. Task submissions, state transitions, retry counters, errors, and completed outputs are recorded before the updated state is returned to the caller.
+
+Each journal record is a versioned event containing only the task records changed by that operation. The journal is replayed in order at startup. A final record without its newline terminator is treated as an interrupted append and discarded; a malformed complete record or unsupported schema version fails startup rather than silently losing state. Each append is flushed with `sync_data`.
+
+A sidecar file lock enforces one independent writer per journal path. Multiple TaskManagers in one process should share cloned handles to the same `TaskRegistry`; opening the same path independently is rejected. This file-backed registry is a single-coordinator persistence mechanism, not a replicated multi-host database.
+
+On startup, tasks found in `Dispatched` or `Running` are moved to `Failed` with an explicit unknown-remote-outcome error. They are never automatically replayed because a participant may have completed side effects before the coordinator stopped. An operator or caller must inspect and explicitly retry; execution remains at-least-once until participant-side deduplication is available.
+
+The journal currently has no compaction or retention policy. It is appropriate as a first durable coordinator backend, not yet a high-volume long-running storage service. Future work includes journal compaction, replicated metadata, coordinator election/leases, and network-visible admission control.
 
 Remaining execution work includes cross-process and cross-host admission coordination, deadlines and cooperative cancellation, dependency graphs, resource-weighted/topology-aware placement, journal compaction and replicated task state, and participant-side deduplication/recovery.
 
