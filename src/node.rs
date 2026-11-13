@@ -1,13 +1,13 @@
 use crate::resource::CompositeResource;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogicalNode {
     pub id: String,
     pub resources: CompositeResource,
     pub runtime: RuntimeSpec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeSpec {
     pub name: String,
     pub version: String,
