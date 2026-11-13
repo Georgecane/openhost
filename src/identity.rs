@@ -1,7 +1,7 @@
 use std::fmt;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     Participant,
     LogicalNode,
@@ -9,7 +9,7 @@ pub enum Kind {
     VirtualMachine,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Identity {
     pub id: String,
     pub kind: Kind,
