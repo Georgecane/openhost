@@ -1903,4 +1903,134 @@ mod tests {
         assert_eq!(failed.status, ExecutionStatus::Failed);
         assert_eq!(failed.error.as_deref(), Some("execution failed"));
     }
+    #[test]
+    fn tcp_engine_executes_partitioned_workload_across_remote_participants() {
+        use crate::endpoint::{ExecutionHandler, ParticipantExecutionEndpoint, RuntimeAdapter};
+        use crate::execution::{ExecutionEngine, ExecutionPlan, PartitionReducer, PartitionResult};
+        use crate::node::LogicalNode;
+        use crate::resource::{Allocation, CompositeResource};
+        use crate::runtime::{Runtime, RuntimeContext, RuntimeError, WorkloadPartition};
+        use std::sync::Arc;
+
+        struct TcpPartitionRuntime;
+
+        impl Runtime for TcpPartitionRuntime {
+            fn name(&self) -> &str {
+                "tcp-partition-runtime"
+            }
+
+            fn run(
+                &self,
+                _context: &RuntimeContext,
+                _workload: WorkItem,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+
+            fn run_partition(
+                &self,
+                _context: &RuntimeContext,
+                partition: WorkloadPartition,
+            ) -> Result<Vec<u8>, RuntimeError> {
+                Ok(partition.payload.into_iter().map(|value| value + 10).collect())
+            }
+        }
+
+        struct OrderedReducer;
+
+        impl PartitionReducer for OrderedReducer {
+            fn reduce(&self, results: &[PartitionResult]) -> Result<Vec<u8>, crate::execution::ExecutionError> {
+                let mut output = Vec::new();
+                for result in results {
+                    output.extend_from_slice(&result.output);
+                }
+                Ok(output)
+            }
+        }
+
+        let participant_a = Identity::new(Kind::Participant);
+        let participant_b = Identity::new(Kind::Participant);
+        let runtime = RuntimeSpec::new("tcp-partition-runtime", "1");
+
+        let endpoint_a: Arc<dyn ExecutionHandler> = Arc::new(
+            ParticipantExecutionEndpoint::new(
+                participant_a.clone(),
+                RuntimeAdapter::new(TcpPartitionRuntime),
+            )
+            .unwrap(),
+        );
+        let endpoint_b: Arc<dyn ExecutionHandler> = Arc::new(
+            ParticipantExecutionEndpoint::new(
+                participant_b.clone(),
+                RuntimeAdapter::new(TcpPartitionRuntime),
+            )
+            .unwrap(),
+        );
+
+        let server_a = TcpEndpointServer::bind("127.0.0.1:0", endpoint_a).unwrap();
+        let server_b = TcpEndpointServer::bind("127.0.0.1:0", endpoint_b).unwrap();
+        let address_a = server_a.local_addr().unwrap();
+        let address_b = server_b.local_addr().unwrap();
+
+        let server_thread_a = std::thread::spawn(move || server_a.serve_n(2));
+        let server_thread_b = std::thread::spawn(move || server_b.serve_n(1));
+
+        let node = LogicalNode {
+            id: Identity::new(Kind::LogicalNode).id,
+            resources: CompositeResource::compose(vec![
+                Allocation {
+                    participant_id: participant_a.id.clone(),
+                    resources: ResourceFragment {
+                        cpu: Cpu { cores: 1.0 },
+                        ..Default::default()
+                    },
+                },
+                Allocation {
+                    participant_id: participant_b.id.clone(),
+                    resources: ResourceFragment {
+                        cpu: Cpu { cores: 1.0 },
+                        ..Default::default()
+                    },
+                },
+            ])
+            .unwrap(),
+            runtime: runtime.clone(),
+        };
+        let workload = WorkItem {
+            id: "tcp-partitioned-workload".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node, &workload).unwrap();
+        let endpoints = vec![
+            ExecutionEndpoint::new(participant_a, address_a.to_string()).unwrap(),
+            ExecutionEndpoint::new(participant_b, address_b.to_string()).unwrap(),
+        ];
+        let engine = ExecutionEngine::new(TcpTransport::new(), endpoints)
+            .with_max_concurrency(3)
+            .unwrap();
+
+        // Deliberately submit out of order; assignment and results must use partition indices.
+        let partitions = vec![
+            WorkloadPartition::new("tcp-partitioned-workload", "part-2", 2, 3, vec![3]),
+            WorkloadPartition::new("tcp-partitioned-workload", "part-0", 0, 3, vec![1]),
+            WorkloadPartition::new("tcp-partitioned-workload", "part-1", 1, 3, vec![2]),
+        ];
+        let receipt = engine
+            .execute_partitioned(&plan, "tcp-partitioned-workload", &partitions)
+            .unwrap();
+
+        assert_eq!(
+            receipt.results.iter().map(|item| item.partition_index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(receipt.reduce(&OrderedReducer).unwrap(), vec![11, 12, 13]);
+        assert_eq!(receipt.results[0].participant_id, plan.units[0].participant_id);
+        assert_eq!(receipt.results[1].participant_id, plan.units[1].participant_id);
+        assert_eq!(receipt.results[2].participant_id, plan.units[0].participant_id);
+
+        server_thread_a.join().unwrap().unwrap();
+        server_thread_b.join().unwrap().unwrap();
+    }
+
+
 }
