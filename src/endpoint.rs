@@ -254,13 +254,12 @@ fn validate_request(
         return Err(EndpointError::EmptyWorkloadId);
     }
 
-    if let Some(partition) = &request.partition {
-        if partition.validate().is_err()
+    if let Some(partition) = &request.partition
+        && (partition.validate().is_err()
             || partition.workload_id != request.workload.id
-            || !request.workload.payload.is_empty()
-        {
-            return Err(EndpointError::InvalidPartition);
-        }
+            || !request.workload.payload.is_empty())
+    {
+        return Err(EndpointError::InvalidPartition);
     }
 
     if request.node_id.kind != Kind::LogicalNode || request.node_id.validate().is_err() {
