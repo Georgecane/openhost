@@ -173,7 +173,7 @@ The engine supports two execution modes. The batch API fans each complete worklo
 
 OpenHost deliberately does **not** split opaque payload bytes automatically: partition boundaries and computation semantics belong to the application. The current placement policy is round-robin, not yet resource-weighted or topology-aware. Dependency graphs, retry/idempotency, cancellation/deadlines, durable execution state, and shared virtual memory are still future work.
 
-The worker pool is persistent for the lifetime of an ExecutionEngine instance. It bounds simultaneous outbound participant requests across concurrent batch submissions, and its bounded queue applies backpressure rather than creating one operating-system thread per allocation or batch. The limit is per engine instance, not process-wide.
+The worker pool is persistent for the lifetime of an ExecutionEngine instance. It bounds simultaneous outbound participant requests across concurrent batch submissions, and its bounded queue applies backpressure rather than creating one operating-system thread per allocation or batch. By default, the limit is per engine instance. An optional, cloneable `AdmissionController` can be injected into multiple engines and task managers to enforce one shared active-request limit with a bounded FIFO waiter queue inside the coordinator process. The per-engine worker limit remains an additional local bound. This is not a cross-process or cross-host admission service; a multi-machine Fabric will need a networked coordinator or lease-based capacity protocol.
 
 ## 13. Task lifecycle (in-memory coordinator)
 
@@ -191,5 +191,5 @@ The first attempt is numbered 1. Retry is an explicit operation, increments the 
 
 This registry is process-local and memory-only. A process restart loses task records and results. Retries are at-least-once: if a participant performed a side effect but its response was lost, a retry may repeat that work. Side-effecting runtimes must implement their own idempotency until task/attempt identity is propagated to durable participant-side deduplication. Exactly-once execution is not claimed.
 
-Remaining execution work includes process-wide admission control across engine instances, deadlines and cooperative cancellation, dependency graphs, resource-weighted/topology-aware placement, durable task state, and participant-side deduplication/recovery.
+Remaining execution work includes cross-process and cross-host admission coordination, deadlines and cooperative cancellation, dependency graphs, resource-weighted/topology-aware placement, durable task state, and participant-side deduplication/recovery.
 
