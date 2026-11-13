@@ -1354,7 +1354,7 @@ mod tests {
     fn partitioned_engine_executes_through_participant_endpoints_and_reduces_results() {
         use crate::endpoint::{ParticipantExecutionEndpoint, RuntimeAdapter};
         use crate::runtime::{Runtime, RuntimeContext, RuntimeError, WorkloadPartition};
-        use crate::transport::{EndpointTransport, ExecutionResponse, Transport};
+        use crate::transport::EndpointTransport;
         use std::sync::Arc;
 
         struct ByteTransformRuntime;
@@ -1397,7 +1397,7 @@ mod tests {
             payload: Vec::new(),
         };
         let plan = ExecutionPlan::from_node(&node, &workload).unwrap();
-        let transport = Arc::new(EndpointTransport::new());
+        let transport = EndpointTransport::new();
         let mut endpoints = Vec::new();
 
         for unit in &plan.units {
@@ -1416,10 +1416,7 @@ mod tests {
             endpoints.push(endpoint);
         }
 
-        let engine = ExecutionEngine::new(
-            Arc::try_unwrap(transport).ok().unwrap(),
-            endpoints,
-        )
+        let engine = ExecutionEngine::new(transport, endpoints)
         .with_max_concurrency(3)
         .unwrap();
 
