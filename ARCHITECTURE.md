@@ -164,3 +164,12 @@ Design → Implement → Debug → Test → Fix → Verify → Continue
 ```
 
 A higher layer should not become authoritative until the current layer's invariants are tested and verified.
+
+## 12. Distributed execution engine (initial implementation)
+
+ExecutionEngine accepts a batch of independent workloads. It expands each workload's execution plan into participant requests and sends the combined request set through a bounded worker pool. The concurrency limit applies to the whole batch, not separately to each workload. Responses are matched to request IDs and receipts are returned in the original workload order. Duplicate workload IDs are rejected within a batch.
+
+This is distributed fan-out across participant execution endpoints. At this stage, every participant assigned to one workload receives the same workload payload. OpenHost does **not** yet split arbitrary payloads into semantically meaningful partitions, build a dependency graph, reduce partial results, or provide shared virtual memory. Those require an explicit task/partition contract and deterministic aggregation semantics; byte-splitting opaque payloads would be incorrect.
+
+The worker pool bounds the number of simultaneous outbound participant requests and avoids creating one operating-system thread per allocation. This limit is per batch invocation. A subsequent stage should add a process-wide admission queue, task IDs and idempotency, cancellation/deadlines, partition/reducer interfaces, and durable execution state before claiming fault-tolerant distributed computation.
+

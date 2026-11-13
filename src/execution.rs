@@ -2,7 +2,9 @@ use crate::identity::{Identity, Kind};
 use crate::node::{LogicalNode, RuntimeSpec};
 use crate::resource::ResourceFragment;
 pub use crate::runtime::Workload as WorkItem;
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionUnit {
@@ -35,6 +37,8 @@ pub enum ExecutionError {
     InvalidRuntimeSpec,
     WorkloadMismatch,
     BackendRejected,
+    InvalidConcurrencyLimit,
+    DuplicateWorkloadId,
 }
 
 impl fmt::Display for ExecutionError {
@@ -99,6 +103,21 @@ pub struct ExecutionDispatcher<T> {
     source_participant_id: Option<Identity>,
     transport: T,
     endpoints: Vec<crate::transport::ExecutionEndpoint>,
+    max_concurrency: usize,
+}
+
+const DEFAULT_MAX_CONCURRENCY: usize = 8;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionJob {
+    pub plan: ExecutionPlan,
+    pub workload: WorkItem,
+}
+
+impl ExecutionJob {
+    pub fn new(plan: ExecutionPlan, workload: WorkItem) -> Self {
+        Self { plan, workload }
+    }
 }
 
 impl<T> ExecutionDispatcher<T> {
@@ -109,6 +128,7 @@ impl<T> ExecutionDispatcher<T> {
             source_participant_id: None,
             transport,
             endpoints,
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
         }
     }
 
@@ -125,11 +145,25 @@ impl<T> ExecutionDispatcher<T> {
             source_participant_id: Some(source_participant_id),
             transport,
             endpoints,
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
         }
     }
 
     pub fn transport(&self) -> &T {
         &self.transport
+    }
+
+    /// Set the maximum number of participant requests dispatched simultaneously.
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Result<Self, ExecutionError> {
+        if max_concurrency == 0 {
+            return Err(ExecutionError::InvalidConcurrencyLimit);
+        }
+        self.max_concurrency = max_concurrency;
+        Ok(self)
+    }
+
+    pub fn max_concurrency(&self) -> usize {
+        self.max_concurrency
     }
 }
 
@@ -139,67 +173,14 @@ impl<T: crate::transport::Transport> ExecutionDispatcher<T> {
         plan: &ExecutionPlan,
         workload: &WorkItem,
     ) -> Result<DispatchReceipt, ExecutionError> {
-        if plan.workload_id != workload.id {
-            return Err(ExecutionError::WorkloadMismatch);
-        }
-        if plan.units.is_empty() {
-            return Err(ExecutionError::EmptyPlan);
-        }
-
-        let requests = plan
-            .units
-            .iter()
-            .map(|unit| {
-                let endpoint = self
-                    .endpoints
-                    .iter()
-                    .find(|endpoint| endpoint.participant_id == unit.participant_id)
-                    .ok_or(ExecutionError::BackendRejected)?;
-
-                Ok(crate::transport::ExecutionRequest {
-                    request_id: format!("{}:{}", workload.id, unit.participant_id.id),
-                    source_participant_id: self.source_participant_id.clone(),
-                    workload: workload.clone(),
-                    node_id: plan.node_id.clone(),
-                    runtime: plan.runtime.clone(),
-                    unit: unit.clone(),
-                    endpoint: endpoint.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, ExecutionError>>()?;
-
-        let responses = std::thread::scope(|scope| {
-            requests
-                .iter()
-                .map(|request| scope.spawn(|| self.transport.dispatch(request.clone())))
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|handle| handle.join().map_err(|_| ExecutionError::BackendRejected))
-                .collect::<Result<Vec<_>, ExecutionError>>()
-        })?;
-
-        let mut dispatched = 0;
-        for (request, response) in requests.iter().zip(responses) {
-            let response = response.map_err(|_| ExecutionError::BackendRejected)?;
-
-            if response.request_id != request.request_id {
-                return Err(ExecutionError::BackendRejected);
-            }
-
-            match response.status {
-                crate::transport::ExecutionStatus::Dispatched
-                | crate::transport::ExecutionStatus::Running
-                | crate::transport::ExecutionStatus::Completed => {
-                    dispatched += 1;
-                }
-                crate::transport::ExecutionStatus::Pending
-                | crate::transport::ExecutionStatus::Failed
-                | crate::transport::ExecutionStatus::Cancelled => {
-                    return Err(ExecutionError::BackendRejected);
-                }
-            }
-        }
-
+        let requests = requests_for_plan(
+            &self.source_participant_id,
+            &self.endpoints,
+            plan,
+            workload,
+        )?;
+        let responses = dispatch_bounded(&self.transport, &requests, self.max_concurrency)?;
+        let dispatched = count_dispatched(&requests, &responses)?;
         Ok(DispatchReceipt::from_responses(
             workload.id.clone(),
             plan.node_id.clone(),
@@ -220,6 +201,271 @@ impl<T: crate::transport::Transport> ExecutionBackend for ExecutionDispatcher<T>
             node_id: receipt.node_id,
             dispatched_units: receipt.dispatched_units,
         })
+    }
+}
+
+
+
+fn requests_for_plan(
+    source_participant_id: &Option<Identity>,
+    endpoints: &[crate::transport::ExecutionEndpoint],
+    plan: &ExecutionPlan,
+    workload: &WorkItem,
+) -> Result<Vec<crate::transport::ExecutionRequest>, ExecutionError> {
+    if plan.workload_id != workload.id {
+        return Err(ExecutionError::WorkloadMismatch);
+    }
+    if workload.id.is_empty() {
+        return Err(ExecutionError::EmptyWorkloadId);
+    }
+    if plan.units.is_empty() {
+        return Err(ExecutionError::EmptyPlan);
+    }
+
+    plan.units
+        .iter()
+        .map(|unit| {
+            let endpoint = endpoints
+                .iter()
+                .find(|endpoint| endpoint.participant_id == unit.participant_id)
+                .ok_or(ExecutionError::BackendRejected)?;
+
+            Ok(crate::transport::ExecutionRequest {
+                request_id: format!("{}:{}", workload.id, unit.participant_id.id),
+                source_participant_id: source_participant_id.clone(),
+                workload: workload.clone(),
+                node_id: plan.node_id.clone(),
+                runtime: plan.runtime.clone(),
+                unit: unit.clone(),
+                endpoint: endpoint.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Dispatch requests through a fixed-size worker set. Results are restored to request order,
+/// regardless of the order in which remote participants respond.
+fn dispatch_bounded<T: crate::transport::Transport>(
+    transport: &T,
+    requests: &[crate::transport::ExecutionRequest],
+    max_concurrency: usize,
+) -> Result<Vec<crate::transport::ExecutionResponse>, ExecutionError> {
+    if max_concurrency == 0 {
+        return Err(ExecutionError::InvalidConcurrencyLimit);
+    }
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = max_concurrency.min(requests.len());
+    let next_request = AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker_panicked = std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let next_request = &next_request;
+            workers.push(scope.spawn(move || loop {
+                let index = next_request.fetch_add(1, Ordering::Relaxed);
+                if index >= requests.len() {
+                    break;
+                }
+
+                let response = transport.dispatch(requests[index].clone());
+                if sender.send((index, response)).is_err() {
+                    break;
+                }
+            }));
+        }
+        drop(sender);
+
+        let mut panicked = false;
+        for worker in workers {
+            panicked |= worker.join().is_err();
+        }
+        panicked
+    });
+
+    if worker_panicked {
+        return Err(ExecutionError::BackendRejected);
+    }
+
+    let mut ordered: Vec<Option<Result<crate::transport::ExecutionResponse, crate::transport::TransportError>>> =
+        (0..requests.len()).map(|_| None).collect();
+    for _ in 0..requests.len() {
+        let (index, response) = receiver
+            .recv()
+            .map_err(|_| ExecutionError::BackendRejected)?;
+        let slot = ordered
+            .get_mut(index)
+            .ok_or(ExecutionError::BackendRejected)?;
+        if slot.replace(response).is_some() {
+            return Err(ExecutionError::BackendRejected);
+        }
+    }
+
+    ordered
+        .into_iter()
+        .map(|response| {
+            response
+                .ok_or(ExecutionError::BackendRejected)?
+                .map_err(|_| ExecutionError::BackendRejected)
+        })
+        .collect()
+}
+
+fn count_dispatched(
+    requests: &[crate::transport::ExecutionRequest],
+    responses: &[crate::transport::ExecutionResponse],
+) -> Result<usize, ExecutionError> {
+    if requests.len() != responses.len() {
+        return Err(ExecutionError::BackendRejected);
+    }
+
+    let mut dispatched = 0;
+    for (request, response) in requests.iter().zip(responses) {
+        if response.request_id != request.request_id {
+            return Err(ExecutionError::BackendRejected);
+        }
+        match response.status {
+            crate::transport::ExecutionStatus::Dispatched
+            | crate::transport::ExecutionStatus::Running
+            | crate::transport::ExecutionStatus::Completed => dispatched += 1,
+            crate::transport::ExecutionStatus::Pending
+            | crate::transport::ExecutionStatus::Failed
+            | crate::transport::ExecutionStatus::Cancelled => {
+                return Err(ExecutionError::BackendRejected);
+            }
+        }
+    }
+    Ok(dispatched)
+}
+
+/// Executes multiple independent workloads across participant allocations using one shared,
+/// bounded parallel dispatch pool. Each workload is fanned out to every unit in its plan.
+pub struct ExecutionEngine<T> {
+    dispatcher: ExecutionDispatcher<T>,
+}
+
+impl<T> ExecutionEngine<T> {
+    pub fn new(
+        transport: T,
+        endpoints: Vec<crate::transport::ExecutionEndpoint>,
+    ) -> Self {
+        Self {
+            dispatcher: ExecutionDispatcher::new(transport, endpoints),
+        }
+    }
+
+    pub fn with_identity(
+        source_participant_id: Identity,
+        transport: T,
+        endpoints: Vec<crate::transport::ExecutionEndpoint>,
+    ) -> Self {
+        Self {
+            dispatcher: ExecutionDispatcher::with_identity(
+                source_participant_id,
+                transport,
+                endpoints,
+            ),
+        }
+    }
+
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Result<Self, ExecutionError> {
+        self.dispatcher = self.dispatcher.with_max_concurrency(max_concurrency)?;
+        Ok(self)
+    }
+
+    pub fn max_concurrency(&self) -> usize {
+        self.dispatcher.max_concurrency()
+    }
+
+    pub fn transport(&self) -> &T {
+        self.dispatcher.transport()
+    }
+}
+
+impl<T: crate::transport::Transport> ExecutionEngine<T> {
+    /// Execute a batch of independent workloads. Every job is dispatched to all participant
+    /// units in its execution plan, with a shared batch concurrency limit.
+    ///
+    /// The returned receipts preserve input job order. A failed or mismatched participant
+    /// response rejects the batch; successful partial results are not reported as complete.
+    pub fn execute_batch(
+        &self,
+        jobs: &[ExecutionJob],
+    ) -> Result<Vec<ExecutionReceipt>, ExecutionError> {
+        if jobs.is_empty() {
+            return Err(ExecutionError::EmptyPlan);
+        }
+
+        let mut seen_workloads = HashSet::with_capacity(jobs.len());
+        let mut requests = Vec::new();
+        let mut owners = Vec::new();
+
+        for (job_index, job) in jobs.iter().enumerate() {
+            if !seen_workloads.insert(job.workload.id.as_str()) {
+                return Err(ExecutionError::DuplicateWorkloadId);
+            }
+
+            let job_requests = requests_for_plan(
+                &self.dispatcher.source_participant_id,
+                &self.dispatcher.endpoints,
+                &job.plan,
+                &job.workload,
+            )?;
+            owners.extend(std::iter::repeat_n(job_index, job_requests.len()));
+            requests.extend(job_requests);
+        }
+
+        let responses = dispatch_bounded(
+            &self.dispatcher.transport,
+            &requests,
+            self.dispatcher.max_concurrency,
+        )?;
+
+        let mut dispatched_by_job = vec![0; jobs.len()];
+        for ((request, response), owner) in requests.iter().zip(&responses).zip(owners) {
+            if response.request_id != request.request_id {
+                return Err(ExecutionError::BackendRejected);
+            }
+            match response.status {
+                crate::transport::ExecutionStatus::Dispatched
+                | crate::transport::ExecutionStatus::Running
+                | crate::transport::ExecutionStatus::Completed => {
+                    dispatched_by_job[owner] += 1;
+                }
+                crate::transport::ExecutionStatus::Pending
+                | crate::transport::ExecutionStatus::Failed
+                | crate::transport::ExecutionStatus::Cancelled => {
+                    return Err(ExecutionError::BackendRejected);
+                }
+            }
+        }
+
+        Ok(jobs
+            .iter()
+            .zip(dispatched_by_job)
+            .map(|(job, dispatched_units)| ExecutionReceipt {
+                workload_id: job.workload.id.clone(),
+                node_id: job.plan.node_id.clone(),
+                dispatched_units,
+            })
+            .collect())
+    }
+}
+
+impl<T: crate::transport::Transport> ExecutionBackend for ExecutionEngine<T> {
+    fn execute(
+        &self,
+        plan: &ExecutionPlan,
+        workload: &WorkItem,
+    ) -> Result<ExecutionReceipt, ExecutionError> {
+        let job = ExecutionJob::new(plan.clone(), workload.clone());
+        self.execute_batch(&[job])?
+            .into_iter()
+            .next()
+            .ok_or(ExecutionError::BackendRejected)
     }
 }
 
@@ -631,4 +877,129 @@ mod tests {
             ExecutionError::WorkloadMismatch
         );
     }
+
+    fn node_with_units(count: usize) -> LogicalNode {
+        let allocations = (0..count)
+            .map(|_| Allocation {
+                participant_id: Identity::new(Kind::Participant).id,
+                resources: ResourceFragment {
+                    cpu: Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+            })
+            .collect();
+        LogicalNode {
+            id: Identity::new(Kind::LogicalNode).id,
+            resources: CompositeResource::compose(allocations).unwrap(),
+            runtime: RuntimeSpec::new("recording", "1"),
+        }
+    }
+
+
+    #[test]
+    fn execution_engine_batches_workloads_with_a_shared_concurrency_limit() {
+        use crate::transport::{ExecutionResponse, ExecutionRequest, Transport, TransportError};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        struct TrackingTransport {
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        impl Transport for TrackingTransport {
+            fn dispatch(
+                &self,
+                request: ExecutionRequest,
+            ) -> Result<ExecutionResponse, TransportError> {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(10));
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ExecutionResponse::completed(request.request_id))
+            }
+        }
+
+        let node = node_with_units(4);
+        let first_workload = WorkItem {
+            id: "batch-first".into(),
+            payload: vec![1],
+        };
+        let second_workload = WorkItem {
+            id: "batch-second".into(),
+            payload: vec![2],
+        };
+        let first_plan = ExecutionPlan::from_node(&node, &first_workload).unwrap();
+        let second_plan = ExecutionPlan::from_node(&node, &second_workload).unwrap();
+        let endpoints = first_plan
+            .units
+            .iter()
+            .map(|unit| {
+                crate::transport::ExecutionEndpoint::new(
+                    unit.participant_id.clone(),
+                    format!("loopback://{}", unit.participant_id.id),
+                )
+                .unwrap()
+            })
+            .collect();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let engine = ExecutionEngine::new(
+            TrackingTransport {
+                active: Arc::clone(&active),
+                peak: Arc::clone(&peak),
+            },
+            endpoints,
+        )
+        .with_max_concurrency(2)
+        .unwrap();
+
+        let receipts = engine
+            .execute_batch(&[
+                ExecutionJob::new(first_plan, first_workload),
+                ExecutionJob::new(second_plan, second_workload),
+            ])
+            .unwrap();
+
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].workload_id, "batch-first");
+        assert_eq!(receipts[1].workload_id, "batch-second");
+        assert_eq!(receipts[0].dispatched_units, 4);
+        assert_eq!(receipts[1].dispatched_units, 4);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn execution_engine_rejects_duplicate_workload_ids_in_a_batch() {
+        let node = node();
+        let workload = WorkItem {
+            id: "duplicate-id".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node, &workload).unwrap();
+        let endpoints = plan
+            .units
+            .iter()
+            .map(|unit| {
+                crate::transport::ExecutionEndpoint::new(
+                    unit.participant_id.clone(),
+                    "loopback://participant",
+                )
+                .unwrap()
+            })
+            .collect();
+        let engine = ExecutionEngine::new(crate::transport::LoopbackTransport, endpoints);
+        let jobs = [
+            ExecutionJob::new(plan.clone(), workload.clone()),
+            ExecutionJob::new(plan, workload),
+        ];
+
+        assert_eq!(
+            engine.execute_batch(&jobs).unwrap_err(),
+            ExecutionError::DuplicateWorkloadId
+        );
+    }
+
 }
