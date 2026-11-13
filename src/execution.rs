@@ -2,7 +2,7 @@ use crate::identity::{Identity, Kind};
 use crate::node::{LogicalNode, RuntimeSpec};
 use crate::resource::ResourceFragment;
 pub use crate::runtime::Workload as WorkItem;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -110,6 +110,152 @@ pub struct ExecutionDispatcher<T> {
 }
 
 const DEFAULT_MAX_CONCURRENCY: usize = 8;
+
+/// A shareable concurrency gate for outbound participant requests.
+///
+/// Clones share the same in-process limit. This is intentionally explicit rather than a
+/// process-global singleton, so independent fabrics and tests can use separate controllers.
+#[derive(Clone)]
+pub struct AdmissionController {
+    inner: std::sync::Arc<AdmissionInner>,
+}
+
+struct AdmissionInner {
+    max_concurrency: usize,
+    max_pending: usize,
+    state: std::sync::Mutex<AdmissionState>,
+    available: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    active: usize,
+    waiters: VecDeque<std::sync::Arc<()>>,
+}
+
+struct AdmissionPermit {
+    inner: std::sync::Arc<AdmissionInner>,
+}
+
+impl AdmissionController {
+    /// Create a shared controller with a pending queue sized to twice the active limit.
+    pub fn new(max_concurrency: usize) -> Result<Self, ExecutionError> {
+        Self::with_limits(max_concurrency, max_concurrency.saturating_mul(2))
+    }
+
+    /// Create a shared controller with explicit active and queued-request limits.
+    ///
+    /// Additional callers block before entering the FIFO queue while it is full.
+    pub fn with_limits(
+        max_concurrency: usize,
+        max_pending: usize,
+    ) -> Result<Self, ExecutionError> {
+        if max_concurrency == 0 {
+            return Err(ExecutionError::InvalidConcurrencyLimit);
+        }
+
+        Ok(Self {
+            inner: std::sync::Arc::new(AdmissionInner {
+                max_concurrency,
+                max_pending,
+                state: std::sync::Mutex::new(AdmissionState::default()),
+                available: std::sync::Condvar::new(),
+            }),
+        })
+    }
+
+    pub fn max_concurrency(&self) -> usize {
+        self.inner.max_concurrency
+    }
+
+    /// Maximum number of callers waiting in the controller's FIFO queue.
+    pub fn max_pending(&self) -> usize {
+        self.inner.max_pending
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+    }
+
+    /// Number of callers currently registered in the FIFO queue.
+    ///
+    /// Callers blocked because this queue is full are not included.
+    pub fn pending_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+            .len()
+    }
+
+    fn acquire(&self) -> AdmissionPermit {
+        let ticket = std::sync::Arc::new(());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        loop {
+            if state.active < self.inner.max_concurrency && state.waiters.is_empty() {
+                state.active += 1;
+                return AdmissionPermit {
+                    inner: std::sync::Arc::clone(&self.inner),
+                };
+            }
+
+            if state.waiters.len() < self.inner.max_pending {
+                state.waiters.push_back(std::sync::Arc::clone(&ticket));
+                break;
+            }
+
+            state = self
+                .inner
+                .available
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+
+        loop {
+            let is_first = state
+                .waiters
+                .front()
+                .is_some_and(|front| std::sync::Arc::ptr_eq(front, &ticket));
+
+            if is_first && state.active < self.inner.max_concurrency {
+                state.waiters.pop_front();
+                state.active += 1;
+                self.inner.available.notify_all();
+                return AdmissionPermit {
+                    inner: std::sync::Arc::clone(&self.inner),
+                };
+            }
+
+            state = self
+                .inner
+                .available
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state.active.saturating_sub(1);
+        self.inner.available.notify_all();
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionJob {
@@ -386,6 +532,7 @@ pub struct ExecutionEngine<T> {
     sender: Option<std::sync::mpsc::SyncSender<EngineDispatchTask>>,
     workers: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
     max_concurrency: usize,
+    admission: Option<AdmissionController>,
 }
 
 impl<T: crate::transport::Transport + 'static> ExecutionEngine<T> {
@@ -417,7 +564,7 @@ impl<T: crate::transport::Transport + 'static> ExecutionEngine<T> {
     ) -> Self {
         let transport = std::sync::Arc::new(transport);
         let (sender, workers) =
-            Self::spawn_worker_pool(std::sync::Arc::clone(&transport), max_concurrency);
+            Self::spawn_worker_pool(std::sync::Arc::clone(&transport), max_concurrency, None);
         Self {
             transport,
             source_participant_id,
@@ -425,12 +572,14 @@ impl<T: crate::transport::Transport + 'static> ExecutionEngine<T> {
             sender: Some(sender),
             workers: std::sync::Mutex::new(workers),
             max_concurrency,
+            admission: None,
         }
     }
 
     fn spawn_worker_pool(
         transport: std::sync::Arc<T>,
         worker_count: usize,
+        admission: Option<AdmissionController>,
     ) -> (
         std::sync::mpsc::SyncSender<EngineDispatchTask>,
         Vec<std::thread::JoinHandle<()>>,
@@ -444,6 +593,7 @@ impl<T: crate::transport::Transport + 'static> ExecutionEngine<T> {
         for _ in 0..worker_count {
             let receiver = std::sync::Arc::clone(&receiver);
             let transport = std::sync::Arc::clone(&transport);
+            let admission = admission.clone();
             workers.push(std::thread::spawn(move || loop {
                 let task = {
                     let Ok(receiver) = receiver.lock() else {
@@ -456,6 +606,7 @@ impl<T: crate::transport::Transport + 'static> ExecutionEngine<T> {
                 };
 
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _permit = admission.as_ref().map(AdmissionController::acquire);
                     transport.dispatch(task.request)
                 }));
                 let result = match outcome {
@@ -486,14 +637,38 @@ impl<T: crate::transport::Transport + 'static> ExecutionEngine<T> {
         }
         self.stop_worker_pool();
         self.max_concurrency = max_concurrency;
-        let (sender, workers) =
-            Self::spawn_worker_pool(std::sync::Arc::clone(&self.transport), max_concurrency);
+        let (sender, workers) = Self::spawn_worker_pool(
+            std::sync::Arc::clone(&self.transport),
+            max_concurrency,
+            self.admission.clone(),
+        );
         self.sender = Some(sender);
         *self
             .workers
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = workers;
         Ok(self)
+    }
+
+    /// Attach a controller shared with other execution engines in this process.
+    ///
+    /// The controller caps simultaneous outbound participant requests across every engine
+    /// configured with a clone of the same handle. The per-engine worker count remains an
+    /// additional local limit.
+    pub fn with_admission_controller(mut self, controller: AdmissionController) -> Self {
+        self.stop_worker_pool();
+        self.admission = Some(controller);
+        let (sender, workers) = Self::spawn_worker_pool(
+            std::sync::Arc::clone(&self.transport),
+            self.max_concurrency,
+            self.admission.clone(),
+        );
+        self.sender = Some(sender);
+        *self
+            .workers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = workers;
+        self
     }
 
     pub fn max_concurrency(&self) -> usize {
@@ -827,6 +1002,110 @@ mod tests {
                 version: "1".into(),
             },
         }
+    }
+
+
+    #[test]
+    fn shared_admission_controller_caps_requests_across_engines() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        #[derive(Clone)]
+        struct ObservedTransport {
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        impl crate::transport::Transport for ObservedTransport {
+            fn dispatch(
+                &self,
+                request: crate::transport::ExecutionRequest,
+            ) -> Result<crate::transport::ExecutionResponse, crate::transport::TransportError> {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(crate::transport::ExecutionResponse::completed(request.request_id))
+            }
+        }
+
+        fn endpoints_for(plan: &ExecutionPlan) -> Vec<crate::transport::ExecutionEndpoint> {
+            plan.units
+                .iter()
+                .map(|unit| {
+                    crate::transport::ExecutionEndpoint::new(
+                        unit.participant_id.clone(),
+                        "loopback://shared-admission",
+                    )
+                    .unwrap()
+                })
+                .collect()
+        }
+
+        let shared = AdmissionController::with_limits(1, 4).unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let workload_a = WorkItem {
+            id: "shared-admission-a".into(),
+            payload: vec![1],
+        };
+        let plan_a = ExecutionPlan::from_node(&node(), &workload_a).unwrap();
+        let job_a = ExecutionJob::new(plan_a.clone(), workload_a);
+        let engine_a = ExecutionEngine::new(
+            ObservedTransport {
+                active: Arc::clone(&active),
+                peak: Arc::clone(&peak),
+            },
+            endpoints_for(&plan_a),
+        )
+        .with_max_concurrency(1)
+        .unwrap()
+        .with_admission_controller(shared.clone());
+
+        let workload_b = WorkItem {
+            id: "shared-admission-b".into(),
+            payload: vec![2],
+        };
+        let plan_b = ExecutionPlan::from_node(&node(), &workload_b).unwrap();
+        let job_b = ExecutionJob::new(plan_b.clone(), workload_b);
+        let engine_b = ExecutionEngine::new(
+            ObservedTransport {
+                active: Arc::clone(&active),
+                peak: Arc::clone(&peak),
+            },
+            endpoints_for(&plan_b),
+        )
+        .with_max_concurrency(1)
+        .unwrap()
+        .with_admission_controller(shared.clone());
+
+        let start = Arc::new(Barrier::new(2));
+        let start_a = Arc::clone(&start);
+        let thread_a = std::thread::spawn(move || {
+            start_a.wait();
+            engine_a.execute_batch(&[job_a]).unwrap()
+        });
+        let start_b = Arc::clone(&start);
+        let thread_b = std::thread::spawn(move || {
+            start_b.wait();
+            engine_b.execute_batch(&[job_b]).unwrap()
+        });
+
+        assert_eq!(thread_a.join().unwrap().len(), 1);
+        assert_eq!(thread_b.join().unwrap().len(), 1);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert_eq!(shared.active_count(), 0);
+        assert_eq!(shared.pending_count(), 0);
+    }
+
+    #[test]
+    fn admission_controller_rejects_zero_concurrency() {
+        assert!(matches!(
+            AdmissionController::new(0),
+            Err(ExecutionError::InvalidConcurrencyLimit)
+        ));
     }
 
     #[test]
