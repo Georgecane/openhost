@@ -1349,4 +1349,163 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn partitioned_engine_executes_through_participant_endpoints_and_reduces_results() {
+        use crate::endpoint::{ParticipantExecutionEndpoint, RuntimeAdapter};
+        use crate::runtime::{Runtime, RuntimeContext, RuntimeError, WorkloadPartition};
+        use crate::transport::{EndpointTransport, ExecutionResponse, Transport};
+        use std::sync::Arc;
+
+        struct ByteTransformRuntime;
+        impl Runtime for ByteTransformRuntime {
+            fn name(&self) -> &str {
+                "byte-transform"
+            }
+
+            fn run(
+                &self,
+                _context: &RuntimeContext,
+                _workload: WorkItem,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+
+            fn run_partition(
+                &self,
+                _context: &RuntimeContext,
+                partition: WorkloadPartition,
+            ) -> Result<Vec<u8>, RuntimeError> {
+                Ok(partition.payload.into_iter().map(|byte| byte + 1).collect())
+            }
+        }
+
+        struct OrderedConcat;
+        impl PartitionReducer for OrderedConcat {
+            fn reduce(&self, results: &[PartitionResult]) -> Result<Vec<u8>, ExecutionError> {
+                let mut output = Vec::new();
+                for result in results {
+                    output.extend_from_slice(&result.output);
+                }
+                Ok(output)
+            }
+        }
+
+        let node = node_with_units(3);
+        let workload = WorkItem {
+            id: "distributed-partition-workload".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node, &workload).unwrap();
+        let transport = Arc::new(EndpointTransport::new());
+        let mut endpoints = Vec::new();
+
+        for unit in &plan.units {
+            let participant_id = unit.participant_id.clone();
+            let endpoint = crate::transport::ExecutionEndpoint::new(
+                participant_id.clone(),
+                format!("in-process://{}", participant_id.id),
+            )
+            .unwrap();
+            let handler = ParticipantExecutionEndpoint::new(
+                participant_id,
+                RuntimeAdapter::new(ByteTransformRuntime),
+            )
+            .unwrap();
+            transport.register(Arc::new(handler)).unwrap();
+            endpoints.push(endpoint);
+        }
+
+        let engine = ExecutionEngine::new(
+            Arc::try_unwrap(transport).ok().unwrap(),
+            endpoints,
+        )
+        .with_max_concurrency(3)
+        .unwrap();
+
+        let partitions = vec![
+            WorkloadPartition::new(
+                "distributed-partition-workload",
+                "partition-c",
+                2,
+                3,
+                vec![30, 31],
+            ),
+            WorkloadPartition::new(
+                "distributed-partition-workload",
+                "partition-a",
+                0,
+                3,
+                vec![10, 11],
+            ),
+            WorkloadPartition::new(
+                "distributed-partition-workload",
+                "partition-b",
+                1,
+                3,
+                vec![20, 21],
+            ),
+        ];
+
+        let receipt = engine
+            .execute_partitioned(
+                &plan,
+                "distributed-partition-workload",
+                &partitions,
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt
+                .results
+                .iter()
+                .map(|result| result.partition_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            receipt.reduce(&OrderedConcat).unwrap(),
+            vec![11, 12, 21, 22, 31, 32]
+        );
+        for (index, result) in receipt.results.iter().enumerate() {
+            assert_eq!(result.participant_id, plan.units[index].participant_id);
+        }
+    }
+
+    #[test]
+    fn partitioned_engine_rejects_duplicate_partition_ids_before_dispatch() {
+        use crate::runtime::WorkloadPartition;
+
+        let node = node_with_units(2);
+        let workload = WorkItem {
+            id: "duplicate-partition-id".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node, &workload).unwrap();
+        let endpoints = plan
+            .units
+            .iter()
+            .map(|unit| {
+                crate::transport::ExecutionEndpoint::new(
+                    unit.participant_id.clone(),
+                    format!("loopback://{}", unit.participant_id.id),
+                )
+                .unwrap()
+            })
+            .collect();
+        let engine = ExecutionEngine::new(crate::transport::LoopbackTransport, endpoints);
+        let partitions = [
+            WorkloadPartition::new("duplicate-partition-id", "same", 0, 2, vec![1]),
+            WorkloadPartition::new("duplicate-partition-id", "same", 1, 2, vec![2]),
+        ];
+
+        assert_eq!(
+            engine
+                .execute_partitioned(&plan, "duplicate-partition-id", &partitions)
+                .unwrap_err(),
+            ExecutionError::DuplicatePartitionId
+        );
+    }
+
+
 }

@@ -1201,6 +1201,37 @@ mod tests {
     }
 
     #[test]
+    fn partition_request_and_result_round_trip_over_protocol_v2() {
+        use crate::runtime::WorkloadPartition;
+        use std::io::Cursor;
+
+        let mut request = request();
+        request.workload.id = "wire-partitioned-workload".into();
+        request.workload.payload.clear();
+        request.partition = Some(WorkloadPartition::new(
+            "wire-partitioned-workload",
+            "partition-0",
+            0,
+            1,
+            vec![1, 3, 5, 7],
+        ));
+
+        let mut encoded_request = Vec::new();
+        write_request(&mut encoded_request, &request).unwrap();
+        let decoded_request = read_request(&mut Cursor::new(encoded_request)).unwrap();
+        assert_eq!(decoded_request, request);
+
+        let response = ExecutionResponse::completed_with_output(
+            "wire-partitioned-workload:partition-0:participant",
+            vec![2, 4, 6, 8],
+        );
+        let mut encoded_response = Vec::new();
+        write_response(&mut encoded_response, &response).unwrap();
+        let decoded_response = read_response(&mut Cursor::new(encoded_response)).unwrap();
+        assert_eq!(decoded_response, response);
+    }
+
+    #[test]
     fn endpoint_rejects_non_participant_identity() {
         let result = ExecutionEndpoint::new(Identity::new(Kind::LogicalNode), "loopback://node");
         assert_eq!(result.unwrap_err(), TransportError::InvalidEndpointIdentity);
