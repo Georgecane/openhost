@@ -155,6 +155,42 @@ OpenHost provides built-in concrete runtime engines:
 - `FunctionRuntime`: executes in-memory closures and functions for low-overhead micro-tasks and embedded workload simulation.
 - `EchoRuntime`: lightweight validation runtime for connectivity and integration verification.
 
+## Distributed execution and durable task coordination
+
+The execution engine supports independent batch jobs and application-defined partitions. `ExecutionEngine` dispatches participant requests over TCP, and `TaskManager` tracks task state, idempotency keys, attempts, and results.
+
+For one coordinator process, multiple task managers can share an admission limit and one durable registry:
+
+```rust
+use openhost::execution::AdmissionController;
+use openhost::task::{TaskManager, TaskRegistry};
+use openhost::transport::TcpTransport;
+
+// Create once and clone into every manager owned by this coordinator.
+let admission = AdmissionController::with_limits(16, 64)?;
+let registry = TaskRegistry::open("/var/lib/openhost/tasks.journal")?;
+
+let manager_a = TaskManager::with_registry(
+    TcpTransport::new(),
+    participant_endpoints_a,
+    registry.clone(),
+)
+.with_admission_controller(admission.clone())
+.with_max_concurrency(8)?;
+
+let manager_b = TaskManager::with_registry(
+    TcpTransport::new(),
+    participant_endpoints_b,
+    registry,
+)
+.with_admission_controller(admission)
+.with_max_concurrency(8)?;
+```
+
+`TaskRegistry::open` records task changes in an append-only journal and restores completed results and idempotency keys after restart. Tasks left `Dispatched` or `Running` at restart are marked `Failed` with an unknown remote outcome; they are not automatically replayed. Retrying remains an explicit at-least-once action.
+
+The journal is a single-coordinator local storage backend, not a replicated database. It contains task inputs and outputs, so protect it as sensitive application data with appropriate filesystem permissions and encrypted storage where required. `TaskRegistry::new()` and `TaskManager::new()` remain memory-only. Cross-host admission, coordinator election, replicated metadata, and durable participant-side deduplication are still future work.
+
 ## Fault tolerance and node healing
 
 When a participant experiences churn, drains, or disconnects during execution:
