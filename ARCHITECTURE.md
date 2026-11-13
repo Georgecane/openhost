@@ -175,7 +175,22 @@ OpenHost deliberately does **not** split opaque payload bytes automatically: par
 
 The worker pool is persistent for the lifetime of an ExecutionEngine instance. It bounds simultaneous outbound participant requests across concurrent batch submissions, and its bounded queue applies backpressure rather than creating one operating-system thread per allocation or batch. By default, the limit is per engine instance. An optional, cloneable `AdmissionController` can be injected into multiple engines and task managers to enforce one shared active-request limit with a bounded FIFO waiter queue inside the coordinator process. The per-engine worker limit remains an additional local bound. This is not a cross-process or cross-host admission service; a multi-machine Fabric will need a networked coordinator or lease-based capacity protocol.
 
-## 13. Task lifecycle (in-memory coordinator)
+## 14. Durable task registry and coordinator recovery
+
+The task registry has two storage modes:
+
+- `TaskRegistry::new()` is process-local and memory-only.
+- `TaskRegistry::open(path)` opens a durable append-only journal. Task submissions, state transitions, retry counters, errors, and completed outputs are recorded before the updated state is returned to the caller.
+
+Each journal record is a versioned event containing only the task records changed by that operation. The journal is replayed in order at startup. A final record without its newline terminator is treated as an interrupted append and discarded; a malformed complete record or unsupported schema version fails startup rather than silently losing state. Each append is flushed with `sync_data`.
+
+A sidecar file lock enforces one independent writer per journal path. Multiple TaskManagers in one process should share cloned handles to the same `TaskRegistry`; opening the same path independently is rejected. This file-backed registry is a single-coordinator persistence mechanism, not a replicated multi-host database.
+
+On startup, tasks found in `Dispatched` or `Running` are moved to `Failed` with an explicit unknown-remote-outcome error. They are never automatically replayed because a participant may have completed side effects before the coordinator stopped. An operator or caller must inspect and explicitly retry; execution remains at-least-once until participant-side deduplication is available.
+
+The journal currently has no compaction or retention policy. It is appropriate as a first durable coordinator backend, not yet a high-volume long-running storage service. Future work includes journal compaction, replicated metadata, coordinator election/leases, and network-visible admission control.
+
+## 13. Task lifecycle (coordinator lifecycle)
 
 The initial TaskManager wraps an ExecutionEngine and records one task per idempotency key. Task IDs are UUIDs. Re-submitting an identical submission with the same idempotency key returns the existing record; reusing that key with a different submission or retry limit is rejected.
 
@@ -191,5 +206,5 @@ The first attempt is numbered 1. Retry is an explicit operation, increments the 
 
 This registry is process-local and memory-only. A process restart loses task records and results. Retries are at-least-once: if a participant performed a side effect but its response was lost, a retry may repeat that work. Side-effecting runtimes must implement their own idempotency until task/attempt identity is propagated to durable participant-side deduplication. Exactly-once execution is not claimed.
 
-Remaining execution work includes cross-process and cross-host admission coordination, deadlines and cooperative cancellation, dependency graphs, resource-weighted/topology-aware placement, durable task state, and participant-side deduplication/recovery.
+Remaining execution work includes cross-process and cross-host admission coordination, deadlines and cooperative cancellation, dependency graphs, resource-weighted/topology-aware placement, journal compaction and replicated task state, and participant-side deduplication/recovery.
 
