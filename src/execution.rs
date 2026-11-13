@@ -6,13 +6,13 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionUnit {
     pub participant_id: Identity,
     pub resources: ResourceFragment,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionPlan {
     pub workload_id: String,
     pub node_id: Identity,
@@ -20,7 +20,7 @@ pub struct ExecutionPlan {
     pub units: Vec<ExecutionUnit>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionReceipt {
     pub workload_id: String,
     pub node_id: Identity,
@@ -257,7 +257,7 @@ impl Drop for AdmissionPermit {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionJob {
     pub plan: ExecutionPlan,
     pub workload: WorkItem,
@@ -269,7 +269,7 @@ impl ExecutionJob {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartitionResult {
     pub partition_id: String,
     pub partition_index: u32,
@@ -277,7 +277,7 @@ pub struct PartitionResult {
     pub output: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PartitionedExecutionReceipt {
     pub workload_id: String,
     pub node_id: Identity,
