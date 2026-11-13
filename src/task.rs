@@ -133,37 +133,39 @@ struct TaskStore {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedRegistrySnapshot {
+struct PersistedRegistryEvent {
     schema_version: u32,
-    tasks: Vec<TaskRecord>,
+    upserts: Vec<TaskRecord>,
 }
 
-impl PersistedRegistrySnapshot {
-    fn from_store(store: &TaskStore) -> Self {
+impl PersistedRegistryEvent {
+    fn new(records: Vec<TaskRecord>) -> Self {
         Self {
             schema_version: 1,
-            tasks: store.tasks.values().cloned().collect(),
+            upserts: records,
         }
     }
 
-    fn into_store(self) -> Result<TaskStore, TaskError> {
+    fn apply(self, store: &mut TaskStore) -> Result<(), TaskError> {
         if self.schema_version != 1 {
             return Err(TaskError::UnsupportedRegistryVersion);
         }
 
-        let mut store = TaskStore::default();
-        for record in self.tasks {
-            if store.tasks.contains_key(&record.id)
-                || store.idempotency.contains_key(&record.idempotency_key)
-            {
+        for record in self.upserts {
+            if let Some(existing) = store.tasks.get(&record.id) {
+                if existing.idempotency_key != record.idempotency_key {
+                    return Err(TaskError::CorruptRegistry);
+                }
+            } else if store.idempotency.contains_key(&record.idempotency_key) {
                 return Err(TaskError::CorruptRegistry);
             }
+
             store
                 .idempotency
                 .insert(record.idempotency_key.clone(), record.id.clone());
             store.tasks.insert(record.id.clone(), record);
         }
-        Ok(store)
+        Ok(())
     }
 }
 
@@ -226,9 +228,9 @@ impl RegistryPersistence {
 
         let mut store = TaskStore::default();
         for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
-            let snapshot: PersistedRegistrySnapshot =
+            let event: PersistedRegistryEvent =
                 serde_json::from_slice(line).map_err(|_| TaskError::CorruptRegistry)?;
-            store = snapshot.into_store()?;
+            event.apply(&mut store)?;
         }
 
         file.seek(SeekFrom::End(0))
@@ -243,10 +245,10 @@ impl RegistryPersistence {
         ))
     }
 
-    fn append(&mut self, store: &TaskStore) -> Result<(), TaskError> {
-        let snapshot = PersistedRegistrySnapshot::from_store(store);
+    fn append(&mut self, records: &[TaskRecord]) -> Result<(), TaskError> {
+        let event = PersistedRegistryEvent::new(records.to_vec());
         let bytes =
-            serde_json::to_vec(&snapshot).map_err(|_| TaskError::PersistenceUnavailable)?;
+            serde_json::to_vec(&event).map_err(|_| TaskError::PersistenceUnavailable)?;
         let previous_len = self
             .file
             .metadata()
@@ -317,11 +319,21 @@ impl TaskRegistry {
         let (result, changed) = operation(&mut next)?;
 
         if changed {
+            let changed_records = next
+                .tasks
+                .iter()
+                .filter_map(|(id, record)| {
+                    (current.tasks.get(id) != Some(record)).then_some(record.clone())
+                })
+                .collect::<Vec<_>>();
+            if changed_records.is_empty() {
+                return Err(TaskError::RegistryUnavailable);
+            }
             if let Some(persistence) = &self.persistence {
                 persistence
                     .lock()
                     .map_err(|_| TaskError::RegistryUnavailable)?
-                    .append(&next)?;
+                    .append(&changed_records)?;
             }
             *current = next;
         }
