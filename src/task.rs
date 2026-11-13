@@ -466,7 +466,7 @@ mod tests {
             .submit_workload("client-request-42", first_job.clone(), 3)
             .unwrap();
         let duplicate = manager
-            .submit_workload("client-request-42", first_job, 3)
+            .submit_workload("client-request-42", first_job.clone(), 3)
             .unwrap();
 
         assert_eq!(first.id, duplicate.id);
