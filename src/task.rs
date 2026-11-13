@@ -1,6 +1,6 @@
 use crate::execution::{
-    ExecutionEngine, ExecutionError, ExecutionJob, ExecutionPlan, ExecutionReceipt,
-    PartitionedExecutionReceipt,
+    AdmissionController, ExecutionEngine, ExecutionError, ExecutionJob, ExecutionPlan,
+    ExecutionReceipt, PartitionedExecutionReceipt,
 };
 use crate::runtime::WorkloadPartition;
 use crate::transport::{ExecutionEndpoint, Transport};
@@ -321,6 +321,13 @@ impl<T: Transport + 'static> TaskManager<T> {
             engine: ExecutionEngine::new(transport, endpoints),
             registry: TaskRegistry::new(),
         }
+    }
+
+
+    /// Configure this manager to share admission capacity with other engines or managers.
+    pub fn with_admission_controller(mut self, controller: AdmissionController) -> Self {
+        self.engine = self.engine.with_admission_controller(controller);
+        self
     }
 
     pub fn with_max_concurrency(
