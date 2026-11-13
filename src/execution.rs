@@ -579,7 +579,14 @@ impl<T: crate::transport::Transport + 'static> ExecutionEngine<T> {
 
 impl<T> Drop for ExecutionEngine<T> {
     fn drop(&mut self) {
-        self.stop_worker_pool();
+        drop(self.sender.take());
+        let workers = self
+            .workers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
