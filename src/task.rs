@@ -6,12 +6,15 @@ use crate::runtime::WorkloadPartition;
 use crate::transport::{ExecutionEndpoint, Transport};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Globally unique identifier for one submitted task.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TaskId(String);
 
 impl TaskId {
@@ -36,7 +39,7 @@ impl fmt::Display for TaskId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskState {
     Pending,
     Dispatched,
@@ -46,7 +49,7 @@ pub enum TaskState {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PartitionedTask {
     pub plan: ExecutionPlan,
     pub workload_id: String,
@@ -70,19 +73,19 @@ impl PartitionedTask {
 /// The immutable input accepted by the task registry.
 ///
 /// An idempotency key can only be reused when the complete submission is identical.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TaskSubmission {
     Workload(ExecutionJob),
     Partitioned(PartitionedTask),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskResult {
     Workload(ExecutionReceipt),
     Partitioned(PartitionedExecutionReceipt),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskRecord {
     pub id: TaskId,
     pub idempotency_key: String,
@@ -93,7 +96,9 @@ pub struct TaskRecord {
     pub max_attempts: u32,
     pub result: Option<TaskResult>,
     pub last_error: Option<String>,
+    #[serde(with = "system_time_serde")]
     pub created_at: SystemTime,
+    #[serde(with = "system_time_serde")]
     pub updated_at: SystemTime,
 }
 
@@ -107,6 +112,10 @@ pub enum TaskError {
     RetryLimitReached,
     RegistryUnavailable,
     EngineConfiguration(ExecutionError),
+    PersistenceUnavailable,
+    RegistryAlreadyOpen,
+    CorruptRegistry,
+    UnsupportedRegistryVersion,
 }
 
 impl fmt::Display for TaskError {
@@ -117,24 +126,207 @@ impl fmt::Display for TaskError {
 
 impl std::error::Error for TaskError {}
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TaskStore {
     tasks: BTreeMap<TaskId, TaskRecord>,
     idempotency: HashMap<String, TaskId>,
 }
 
-/// Thread-safe, in-memory task metadata and idempotency registry.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedRegistrySnapshot {
+    schema_version: u32,
+    tasks: Vec<TaskRecord>,
+}
+
+impl PersistedRegistrySnapshot {
+    fn from_store(store: &TaskStore) -> Self {
+        Self {
+            schema_version: 1,
+            tasks: store.tasks.values().cloned().collect(),
+        }
+    }
+
+    fn into_store(self) -> Result<TaskStore, TaskError> {
+        if self.schema_version != 1 {
+            return Err(TaskError::UnsupportedRegistryVersion);
+        }
+
+        let mut store = TaskStore::default();
+        for record in self.tasks {
+            if store.tasks.contains_key(&record.id)
+                || store.idempotency.contains_key(&record.idempotency_key)
+            {
+                return Err(TaskError::CorruptRegistry);
+            }
+            store
+                .idempotency
+                .insert(record.idempotency_key.clone(), record.id.clone());
+            store.tasks.insert(record.id.clone(), record);
+        }
+        Ok(store)
+    }
+}
+
+struct RegistryPersistence {
+    file: File,
+    // Keeping this handle alive holds the exclusive process-level registry lock.
+    _lock_file: File,
+}
+
+impl RegistryPersistence {
+    fn lock_path(path: &Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(".lock");
+        PathBuf::from(value)
+    }
+
+    fn open(path: &Path) -> Result<(TaskStore, Self), TaskError> {
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|_| TaskError::PersistenceUnavailable)?;
+        }
+
+        let lock_path = Self::lock_path(path);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .map_err(|_| TaskError::PersistenceUnavailable)?;
+        lock_file
+            .try_lock()
+            .map_err(|_| TaskError::RegistryAlreadyOpen)?;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|_| TaskError::PersistenceUnavailable)?;
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| TaskError::PersistenceUnavailable)?;
+
+        // Every committed event ends with a newline. A final partial line is an interrupted
+        // append and is discarded; malformed complete lines are treated as corruption.
+        let valid_len = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\\n')
+            .map_or(0, |index| index + 1);
+        if valid_len != bytes.len() {
+            file.set_len(valid_len as u64)
+                .map_err(|_| TaskError::PersistenceUnavailable)?;
+            file.sync_data()
+                .map_err(|_| TaskError::PersistenceUnavailable)?;
+            bytes.truncate(valid_len);
+        }
+
+        let mut store = TaskStore::default();
+        for line in bytes.split(|byte| *byte == b'\\n').filter(|line| !line.is_empty()) {
+            let snapshot: PersistedRegistrySnapshot =
+                serde_json::from_slice(line).map_err(|_| TaskError::CorruptRegistry)?;
+            store = snapshot.into_store()?;
+        }
+
+        file.seek(SeekFrom::End(0))
+            .map_err(|_| TaskError::PersistenceUnavailable)?;
+
+        Ok((
+            store,
+            Self {
+                file,
+                _lock_file: lock_file,
+            },
+        ))
+    }
+
+    fn append(&mut self, store: &TaskStore) -> Result<(), TaskError> {
+        let snapshot = PersistedRegistrySnapshot::from_store(store);
+        let bytes =
+            serde_json::to_vec(&snapshot).map_err(|_| TaskError::PersistenceUnavailable)?;
+        let previous_len = self
+            .file
+            .metadata()
+            .map_err(|_| TaskError::PersistenceUnavailable)?
+            .len();
+
+        let append_result = (|| -> std::io::Result<()> {
+            self.file.seek(SeekFrom::End(0))?;
+            self.file.write_all(&bytes)?;
+            self.file.write_all(b"\\n")?;
+            self.file.sync_data()
+        })();
+
+        if append_result.is_err() {
+            // Do not leave a partial event that could be mistaken for a committed state later.
+            let _ = self.file.set_len(previous_len);
+            let _ = self.file.seek(SeekFrom::End(0));
+            let _ = self.file.sync_data();
+            return Err(TaskError::PersistenceUnavailable);
+        }
+
+        Ok(())
+    }
+}
+
+/// Thread-safe task metadata and idempotency registry.
 ///
-/// This registry is process-local and is not crash durable. A future persistent backend can
-/// implement the same state machine without changing the execution engine contract.
-#[derive(Default)]
+/// The default constructor is memory-only. Use `open` for an append-only, crash-recoverable
+/// registry. A durable registry takes an exclusive process lock for its lifetime; multiple
+/// TaskManagers in one process should share a clone of the same TaskRegistry handle.
+#[derive(Clone, Default)]
 pub struct TaskRegistry {
-    store: Mutex<TaskStore>,
+    store: Arc<Mutex<TaskStore>>,
+    persistence: Option<Arc<Mutex<RegistryPersistence>>>,
 }
 
 impl TaskRegistry {
+    /// Create a process-local registry that is not crash durable.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open or create a durable registry journal.
+    ///
+    /// Every state transition is appended as a versioned full-state snapshot and fsynced before
+    /// becoming visible to callers. An unfinished trailing journal record is discarded on
+    /// recovery. The lock file prevents two independent registry owners from writing the same
+    /// journal concurrently.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, TaskError> {
+        let (store, persistence) = RegistryPersistence::open(path.as_ref())?;
+        let registry = Self {
+            store: Arc::new(Mutex::new(store)),
+            persistence: Some(Arc::new(Mutex::new(persistence))),
+        };
+        registry.recover_interrupted()?;
+        Ok(registry)
+    }
+
+    fn transact<R>(
+        &self,
+        operation: impl FnOnce(&mut TaskStore) -> Result<(R, bool), TaskError>,
+    ) -> Result<R, TaskError> {
+        let mut current = self
+            .store
+            .lock()
+            .map_err(|_| TaskError::RegistryUnavailable)?;
+        let mut next = current.clone();
+        let (result, changed) = operation(&mut next)?;
+
+        if changed {
+            if let Some(persistence) = &self.persistence {
+                persistence
+                    .lock()
+                    .map_err(|_| TaskError::RegistryUnavailable)?
+                    .append(&next)?;
+            }
+            *current = next;
+        }
+
+        Ok(result)
     }
 
     pub fn submit(
@@ -151,45 +343,42 @@ impl TaskRegistry {
             return Err(TaskError::InvalidAttemptLimit);
         }
 
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| TaskError::RegistryUnavailable)?;
-
-        if let Some(existing_id) = store.idempotency.get(&idempotency_key) {
-            let existing = store
-                .tasks
-                .get(existing_id)
-                .ok_or(TaskError::RegistryUnavailable)?;
-            if existing.submission != submission || existing.max_attempts != max_attempts {
-                return Err(TaskError::IdempotencyConflict);
+        self.transact(move |store| {
+            if let Some(existing_id) = store.idempotency.get(&idempotency_key) {
+                let existing = store
+                    .tasks
+                    .get(existing_id)
+                    .ok_or(TaskError::RegistryUnavailable)?;
+                if existing.submission != submission || existing.max_attempts != max_attempts {
+                    return Err(TaskError::IdempotencyConflict);
+                }
+                return Ok((existing.clone(), false));
             }
-            return Ok(existing.clone());
-        }
 
-        let id = loop {
-            let candidate = TaskId::new();
-            if !store.tasks.contains_key(&candidate) {
-                break candidate;
-            }
-        };
-        let now = SystemTime::now();
-        let record = TaskRecord {
-            id: id.clone(),
-            idempotency_key: idempotency_key.clone(),
-            submission,
-            state: TaskState::Pending,
-            attempt: 1,
-            max_attempts,
-            result: None,
-            last_error: None,
-            created_at: now,
-            updated_at: now,
-        };
+            let id = loop {
+                let candidate = TaskId::new();
+                if !store.tasks.contains_key(&candidate) {
+                    break candidate;
+                }
+            };
+            let now = SystemTime::now();
+            let record = TaskRecord {
+                id: id.clone(),
+                idempotency_key: idempotency_key.clone(),
+                submission,
+                state: TaskState::Pending,
+                attempt: 1,
+                max_attempts,
+                result: None,
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            };
 
-        store.idempotency.insert(idempotency_key, id.clone());
-        store.tasks.insert(id, record.clone());
-        Ok(record)
+            store.idempotency.insert(idempotency_key, id.clone());
+            store.tasks.insert(id, record.clone());
+            Ok((record, true))
+        })
     }
 
     pub fn get(&self, id: &TaskId) -> Result<TaskRecord, TaskError> {
@@ -217,25 +406,23 @@ impl TaskRegistry {
         id: &TaskId,
         next: TaskState,
     ) -> Result<TaskRecord, TaskError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| TaskError::RegistryUnavailable)?;
-        let record = store.tasks.get_mut(id).ok_or(TaskError::TaskNotFound)?;
+        self.transact(|store| {
+            let record = store.tasks.get_mut(id).ok_or(TaskError::TaskNotFound)?;
 
-        let allowed = matches!(
-            (record.state, next),
-            (TaskState::Pending, TaskState::Dispatched)
-                | (TaskState::Pending, TaskState::Cancelled)
-                | (TaskState::Dispatched, TaskState::Running)
-        );
-        if !allowed {
-            return Err(TaskError::InvalidTransition);
-        }
+            let allowed = matches!(
+                (record.state, next),
+                (TaskState::Pending, TaskState::Dispatched)
+                    | (TaskState::Pending, TaskState::Cancelled)
+                    | (TaskState::Dispatched, TaskState::Running)
+            );
+            if !allowed {
+                return Err(TaskError::InvalidTransition);
+            }
 
-        record.state = next;
-        record.updated_at = SystemTime::now();
-        Ok(record.clone())
+            record.state = next;
+            record.updated_at = SystemTime::now();
+            Ok((record.clone(), true))
+        })
     }
 
     fn complete(
@@ -243,20 +430,18 @@ impl TaskRegistry {
         id: &TaskId,
         result: TaskResult,
     ) -> Result<TaskRecord, TaskError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| TaskError::RegistryUnavailable)?;
-        let record = store.tasks.get_mut(id).ok_or(TaskError::TaskNotFound)?;
-        if record.state != TaskState::Running {
-            return Err(TaskError::InvalidTransition);
-        }
+        self.transact(|store| {
+            let record = store.tasks.get_mut(id).ok_or(TaskError::TaskNotFound)?;
+            if record.state != TaskState::Running {
+                return Err(TaskError::InvalidTransition);
+            }
 
-        record.state = TaskState::Completed;
-        record.result = Some(result);
-        record.last_error = None;
-        record.updated_at = SystemTime::now();
-        Ok(record.clone())
+            record.state = TaskState::Completed;
+            record.result = Some(result);
+            record.last_error = None;
+            record.updated_at = SystemTime::now();
+            Ok((record.clone(), true))
+        })
     }
 
     fn fail(
@@ -264,41 +449,85 @@ impl TaskRegistry {
         id: &TaskId,
         error: String,
     ) -> Result<TaskRecord, TaskError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| TaskError::RegistryUnavailable)?;
-        let record = store.tasks.get_mut(id).ok_or(TaskError::TaskNotFound)?;
-        if record.state != TaskState::Running {
-            return Err(TaskError::InvalidTransition);
-        }
+        self.transact(|store| {
+            let record = store.tasks.get_mut(id).ok_or(TaskError::TaskNotFound)?;
+            if record.state != TaskState::Running {
+                return Err(TaskError::InvalidTransition);
+            }
 
-        record.state = TaskState::Failed;
-        record.result = None;
-        record.last_error = Some(error);
-        record.updated_at = SystemTime::now();
-        Ok(record.clone())
+            record.state = TaskState::Failed;
+            record.result = None;
+            record.last_error = Some(error);
+            record.updated_at = SystemTime::now();
+            Ok((record.clone(), true))
+        })
     }
 
     fn retry_failed(&self, id: &TaskId) -> Result<TaskRecord, TaskError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| TaskError::RegistryUnavailable)?;
-        let record = store.tasks.get_mut(id).ok_or(TaskError::TaskNotFound)?;
-        if record.state != TaskState::Failed {
-            return Err(TaskError::InvalidTransition);
-        }
-        if record.attempt >= record.max_attempts {
-            return Err(TaskError::RetryLimitReached);
-        }
+        self.transact(|store| {
+            let record = store.tasks.get_mut(id).ok_or(TaskError::TaskNotFound)?;
+            if record.state != TaskState::Failed {
+                return Err(TaskError::InvalidTransition);
+            }
+            if record.attempt >= record.max_attempts {
+                return Err(TaskError::RetryLimitReached);
+            }
 
-        record.attempt += 1;
-        record.state = TaskState::Pending;
-        record.result = None;
-        record.last_error = None;
-        record.updated_at = SystemTime::now();
-        Ok(record.clone())
+            record.attempt += 1;
+            record.state = TaskState::Pending;
+            record.result = None;
+            record.last_error = None;
+            record.updated_at = SystemTime::now();
+            Ok((record.clone(), true))
+        })
+    }
+
+    /// Convert tasks left Dispatched or Running by a previous coordinator process into Failed.
+    ///
+    /// The remote outcome is unknown, so recovery never replays these tasks automatically.
+    /// The caller may inspect the failure and explicitly retry under the existing at-least-once
+    /// contract.
+    pub fn recover_interrupted(&self) -> Result<usize, TaskError> {
+        self.transact(|store| {
+            let mut recovered = 0;
+            for record in store.tasks.values_mut() {
+                if matches!(record.state, TaskState::Dispatched | TaskState::Running) {
+                    let previous = record.state;
+                    record.state = TaskState::Failed;
+                    record.last_error = Some(format!(
+                        "Coordinator restarted while task was {previous:?}; remote outcome is unknown"
+                    ));
+                    record.result = None;
+                    record.updated_at = SystemTime::now();
+                    recovered += 1;
+                }
+            }
+            Ok((recovered, recovered > 0))
+        })
+    }
+}
+
+mod system_time_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S>(value: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let elapsed = value.duration_since(UNIX_EPOCH).unwrap_or_default();
+        (elapsed.as_secs(), elapsed.subsec_nanos()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (seconds, nanos) = <(u64, u32)>::deserialize(deserializer)?;
+        if nanos >= 1_000_000_000 {
+            return Err(serde::de::Error::custom("invalid system time nanoseconds"));
+        }
+        Ok(UNIX_EPOCH + Duration::new(seconds, nanos))
     }
 }
 
@@ -317,10 +546,29 @@ impl<T: Transport + 'static> TaskManager<T> {
         transport: T,
         endpoints: Vec<ExecutionEndpoint>,
     ) -> Self {
+        Self::with_registry(transport, endpoints, TaskRegistry::new())
+    }
+
+    /// Create a manager that shares an existing registry with other managers.
+    pub fn with_registry(
+        transport: T,
+        endpoints: Vec<ExecutionEndpoint>,
+        registry: TaskRegistry,
+    ) -> Self {
         Self {
             engine: ExecutionEngine::new(transport, endpoints),
-            registry: TaskRegistry::new(),
+            registry,
         }
+    }
+
+    /// Create a manager backed by a durable task registry journal.
+    pub fn open(
+        transport: T,
+        endpoints: Vec<ExecutionEndpoint>,
+        registry_path: impl AsRef<Path>,
+    ) -> Result<Self, TaskError> {
+        let registry = TaskRegistry::open(registry_path)?;
+        Ok(Self::with_registry(transport, endpoints, registry))
     }
 
 
