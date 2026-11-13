@@ -173,5 +173,23 @@ The engine supports two execution modes. The batch API fans each complete worklo
 
 OpenHost deliberately does **not** split opaque payload bytes automatically: partition boundaries and computation semantics belong to the application. The current placement policy is round-robin, not yet resource-weighted or topology-aware. Dependency graphs, retry/idempotency, cancellation/deadlines, durable execution state, and shared virtual memory are still future work.
 
-The worker pool is persistent for the lifetime of an ExecutionEngine instance. It bounds simultaneous outbound participant requests across concurrent batch submissions, and its bounded queue applies backpressure rather than creating one operating-system thread per allocation or batch. A subsequent stage should add cross-engine admission control, task IDs and idempotency, cancellation/deadlines, explicit partition/reducer interfaces, and durable execution state before claiming fault-tolerant distributed computation.
+The worker pool is persistent for the lifetime of an ExecutionEngine instance. It bounds simultaneous outbound participant requests across concurrent batch submissions, and its bounded queue applies backpressure rather than creating one operating-system thread per allocation or batch. The limit is per engine instance, not process-wide.
+
+## 13. Task lifecycle (in-memory coordinator)
+
+The initial TaskManager wraps an ExecutionEngine and records one task per idempotency key. Task IDs are UUIDs. Re-submitting an identical submission with the same idempotency key returns the existing record; reusing that key with a different submission or retry limit is rejected.
+
+The task state machine is:
+
+```
+Pending → Dispatched → Running → Completed
+   │                         └──→ Failed → Pending (explicit retry)
+   └──→ Cancelled
+```
+
+The first attempt is numbered 1. Retry is an explicit operation, increments the attempt number, and is bounded by max_attempts. Cancellation is currently supported only while a task is Pending; it does not interrupt work already running. A successful task record stores either its workload receipt or its partition outputs.
+
+This registry is process-local and memory-only. A process restart loses task records and results. Retries are at-least-once: if a participant performed a side effect but its response was lost, a retry may repeat that work. Side-effecting runtimes must implement their own idempotency until task/attempt identity is propagated to durable participant-side deduplication. Exactly-once execution is not claimed.
+
+Remaining execution work includes process-wide admission control across engine instances, deadlines and cooperative cancellation, dependency graphs, resource-weighted/topology-aware placement, durable task state, and participant-side deduplication/recovery.
 

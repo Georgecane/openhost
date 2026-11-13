@@ -161,7 +161,7 @@ impl TaskRegistry {
                 .tasks
                 .get(existing_id)
                 .ok_or(TaskError::RegistryUnavailable)?;
-            if existing.submission != submission {
+            if existing.submission != submission || existing.max_attempts != max_attempts {
                 return Err(TaskError::IdempotencyConflict);
             }
             return Ok(existing.clone());
@@ -473,6 +473,12 @@ mod tests {
         assert_eq!(duplicate.state, TaskState::Pending);
         assert_eq!(
             manager
+                .submit_workload("client-request-42", first_job, 2)
+                .unwrap_err(),
+            TaskError::IdempotencyConflict
+        );
+        assert_eq!(
+            manager
                 .submit_workload("client-request-42", different_job, 3)
                 .unwrap_err(),
             TaskError::IdempotencyConflict
@@ -572,4 +578,102 @@ mod tests {
             TaskError::InvalidTransition
         );
     }
+
+    #[test]
+    fn task_manager_executes_partitioned_task_through_tcp_and_records_result() {
+        use crate::endpoint::{
+            ExecutionHandler, ParticipantExecutionEndpoint, RuntimeAdapter,
+        };
+        use crate::node::RuntimeSpec;
+        use crate::resource::{Allocation, CompositeResource, Cpu, ResourceFragment};
+        use crate::runtime::{Runtime, RuntimeContext, RuntimeError, WorkloadPartition};
+        use crate::transport::{TcpEndpointServer, TcpTransport};
+        use crate::node::LogicalNode;
+        use std::sync::Arc;
+
+        struct TcpTaskRuntime;
+
+        impl Runtime for TcpTaskRuntime {
+            fn name(&self) -> &str {
+                "tcp-task-runtime"
+            }
+
+            fn run(
+                &self,
+                _context: &RuntimeContext,
+                _workload: WorkItem,
+            ) -> Result<(), RuntimeError> {
+                Ok(())
+            }
+
+            fn run_partition(
+                &self,
+                _context: &RuntimeContext,
+                partition: WorkloadPartition,
+            ) -> Result<Vec<u8>, RuntimeError> {
+                Ok(partition.payload.into_iter().map(|byte| byte * 2).collect())
+            }
+        }
+
+        let participant_id = Identity::new(Kind::Participant);
+        let handler: Arc<dyn ExecutionHandler> = Arc::new(
+            ParticipantExecutionEndpoint::new(
+                participant_id.clone(),
+                RuntimeAdapter::new(TcpTaskRuntime),
+            )
+            .unwrap(),
+        );
+        let server = TcpEndpointServer::bind("127.0.0.1:0", handler).unwrap();
+        let address = server.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || server.serve_n(1));
+
+        let node = LogicalNode {
+            id: Identity::new(Kind::LogicalNode).id,
+            resources: CompositeResource::compose(vec![Allocation {
+                participant_id: participant_id.id.clone(),
+                resources: ResourceFragment {
+                    cpu: Cpu { cores: 1.0 },
+                    ..Default::default()
+                },
+            }])
+            .unwrap(),
+            runtime: RuntimeSpec::new("tcp-task-runtime", "1"),
+        };
+        let workload = WorkItem {
+            id: "task-manager-tcp-workload".into(),
+            payload: Vec::new(),
+        };
+        let plan = ExecutionPlan::from_node(&node, &workload).unwrap();
+        let endpoint = ExecutionEndpoint::new(participant_id, address.to_string()).unwrap();
+        let manager = TaskManager::new(TcpTransport::new(), vec![endpoint])
+            .with_max_concurrency(1)
+            .unwrap();
+        let submission = PartitionedTask::new(
+            plan,
+            "task-manager-tcp-workload",
+            vec![WorkloadPartition::new(
+                "task-manager-tcp-workload",
+                "only-partition",
+                0,
+                1,
+                vec![4, 5, 6],
+            )],
+        );
+
+        let submitted = manager
+            .submit_partitioned("tcp-task-idempotency-key", submission, 2)
+            .unwrap();
+        let completed = manager.run_task(&submitted.id).unwrap();
+
+        assert_eq!(completed.state, TaskState::Completed);
+        assert_eq!(completed.attempt, 1);
+        let TaskResult::Partitioned(receipt) = completed.result.unwrap() else {
+            panic!("task should contain a partitioned execution result");
+        };
+        assert_eq!(receipt.results.len(), 1);
+        assert_eq!(receipt.results[0].output, vec![8, 10, 12]);
+
+        server_thread.join().unwrap().unwrap();
+    }
+
 }
