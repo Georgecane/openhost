@@ -300,8 +300,8 @@ impl TaskRegistry {
     /// Open or create a durable registry journal.
     ///
     /// Every state transition is appended as a versioned event containing only changed task
-    /// records and synced before becoming visible to callers. An unfinished trailing event is discarded on
-    /// recovery. The lock file prevents two independent registry owners from writing the same
+    /// records and synced before becoming visible to callers. An unfinished trailing event is
+    /// discarded on recovery. The lock file prevents two independent registry owners from writing the same
     /// journal concurrently.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TaskError> {
         let (store, persistence) = RegistryPersistence::open(path.as_ref())?;
@@ -505,7 +505,7 @@ impl TaskRegistry {
     /// The remote outcome is unknown, so recovery never replays these tasks automatically.
     /// The caller may inspect the failure and explicitly retry under the existing at-least-once
     /// contract.
-    pub fn recover_interrupted(&self) -> Result<usize, TaskError> {
+    fn recover_interrupted(&self) -> Result<usize, TaskError> {
         self.transact(|store| {
             let mut recovered = 0;
             for record in store.tasks.values_mut() {
