@@ -931,4 +931,156 @@ mod tests {
         server_thread.join().unwrap().unwrap();
     }
 
+    fn temp_registry_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "openhost-{label}-{}.journal",
+            Uuid::new_v4()
+        ))
+    }
+
+    fn remove_registry_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(RegistryPersistence::lock_path(path));
+    }
+
+    #[test]
+    fn durable_registry_restores_completed_task_and_idempotency_after_restart() {
+        let path = temp_registry_path("durable-complete");
+        let (task, endpoints) = job("durable-workload");
+
+        let registry = TaskRegistry::open(&path).unwrap();
+        let manager =
+            TaskManager::with_registry(LoopbackTransport, endpoints, registry.clone());
+        let submitted = manager
+            .submit_workload("durable-idempotency-key", task.clone(), 3)
+            .unwrap();
+        let completed = manager.run_task(&submitted.id).unwrap();
+
+        assert_eq!(completed.state, TaskState::Completed);
+        assert!(completed.result.is_some());
+        drop(manager);
+        drop(registry);
+
+        let reopened = TaskRegistry::open(&path).unwrap();
+        let restored = reopened.get(&submitted.id).unwrap();
+        assert_eq!(restored.state, TaskState::Completed);
+        assert_eq!(restored.result, completed.result);
+        assert_eq!(restored.attempt, 1);
+
+        let duplicate = reopened
+            .submit(
+                "durable-idempotency-key",
+                TaskSubmission::Workload(task),
+                3,
+            )
+            .unwrap();
+        assert_eq!(duplicate.id, submitted.id);
+        assert_eq!(reopened.list().unwrap().len(), 1);
+
+        drop(reopened);
+        remove_registry_files(&path);
+    }
+
+    #[test]
+    fn durable_registry_recovers_in_flight_tasks_as_failed_without_replaying() {
+        let path = temp_registry_path("durable-recovery");
+        let (task, _) = job("interrupted-workload");
+
+        let registry = TaskRegistry::open(&path).unwrap();
+        let submitted = registry
+            .submit("interrupted-key", TaskSubmission::Workload(task), 2)
+            .unwrap();
+        registry
+            .transition(&submitted.id, TaskState::Dispatched)
+            .unwrap();
+        registry
+            .transition(&submitted.id, TaskState::Running)
+            .unwrap();
+        drop(registry);
+
+        let reopened = TaskRegistry::open(&path).unwrap();
+        let recovered = reopened.get(&submitted.id).unwrap();
+        assert_eq!(recovered.state, TaskState::Failed);
+        assert_eq!(recovered.attempt, 1);
+        assert!(
+            recovered
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("remote outcome is unknown"))
+        );
+
+        let retry = reopened.retry_failed(&submitted.id).unwrap();
+        assert_eq!(retry.state, TaskState::Pending);
+        assert_eq!(retry.attempt, 2);
+
+        drop(reopened);
+        remove_registry_files(&path);
+    }
+
+    #[test]
+    fn durable_registry_rejects_a_second_independent_writer() {
+        let path = temp_registry_path("durable-lock");
+        let registry = TaskRegistry::open(&path).unwrap();
+
+        assert!(matches!(
+            TaskRegistry::open(&path),
+            Err(TaskError::RegistryAlreadyOpen)
+        ));
+
+        drop(registry);
+        let reopened = TaskRegistry::open(&path).unwrap();
+        drop(reopened);
+        remove_registry_files(&path);
+    }
+
+    #[test]
+    fn durable_registry_discards_only_an_incomplete_trailing_record() {
+        use std::io::Write;
+
+        let path = temp_registry_path("durable-tail");
+        let (task, _) = job("tail-workload");
+        let registry = TaskRegistry::open(&path).unwrap();
+        let submitted = registry
+            .submit("tail-key", TaskSubmission::Workload(task), 1)
+            .unwrap();
+        drop(registry);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\\"schema_version\\":")
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reopened = TaskRegistry::open(&path).unwrap();
+        assert_eq!(
+            reopened.get(&submitted.id).unwrap().state,
+            TaskState::Pending
+        );
+        drop(reopened);
+        remove_registry_files(&path);
+    }
+
+    #[test]
+    fn task_registry_clones_share_the_same_durable_store() {
+        let path = temp_registry_path("durable-clone");
+        let first = TaskRegistry::open(&path).unwrap();
+        let second = first.clone();
+        let (task, _) = job("clone-shared-workload");
+
+        let submitted = first
+            .submit("clone-shared-key", TaskSubmission::Workload(task), 1)
+            .unwrap();
+        assert_eq!(second.get(&submitted.id).unwrap(), submitted);
+
+        drop(first);
+        drop(second);
+        let reopened = TaskRegistry::open(&path).unwrap();
+        assert_eq!(reopened.list().unwrap().len(), 1);
+        drop(reopened);
+        remove_registry_files(&path);
+    }
+
 }
