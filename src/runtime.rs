@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Workload {
     pub id: String,
     pub payload: Vec<u8>,
@@ -23,7 +23,7 @@ impl Workload {
 
 /// An application-defined, independently executable part of a workload.
 /// The payload is never split implicitly because its format and semantics belong to the application.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkloadPartition {
     pub workload_id: String,
     pub partition_id: String,
