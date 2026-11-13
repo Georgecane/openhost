@@ -39,6 +39,9 @@ pub enum ExecutionError {
     BackendRejected,
     InvalidConcurrencyLimit,
     DuplicateWorkloadId,
+    InvalidPartition,
+    DuplicatePartitionId,
+    MissingPartitionOutput,
 }
 
 impl fmt::Display for ExecutionError {
@@ -117,6 +120,32 @@ pub struct ExecutionJob {
 impl ExecutionJob {
     pub fn new(plan: ExecutionPlan, workload: WorkItem) -> Self {
         Self { plan, workload }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionResult {
+    pub partition_id: String,
+    pub partition_index: u32,
+    pub participant_id: Identity,
+    pub output: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionedExecutionReceipt {
+    pub workload_id: String,
+    pub node_id: Identity,
+    /// Ordered by partition index, independent of response arrival order.
+    pub results: Vec<PartitionResult>,
+}
+
+pub trait PartitionReducer: Send + Sync {
+    fn reduce(&self, results: &[PartitionResult]) -> Result<Vec<u8>, ExecutionError>;
+}
+
+impl PartitionedExecutionReceipt {
+    pub fn reduce<R: PartitionReducer>(&self, reducer: &R) -> Result<Vec<u8>, ExecutionError> {
+        reducer.reduce(&self.results)
     }
 }
 
@@ -234,6 +263,7 @@ fn requests_for_plan(
                 request_id: format!("{}:{}", workload.id, unit.participant_id.id),
                 source_participant_id: source_participant_id.clone(),
                 workload: workload.clone(),
+                partition: None,
                 node_id: plan.node_id.clone(),
                 runtime: plan.runtime.clone(),
                 unit: unit.clone(),
@@ -510,6 +540,106 @@ impl<T: crate::transport::Transport + 'static> ExecutionEngine<T> {
             .into_iter()
             .map(|response| response.ok_or(ExecutionError::BackendRejected)?)
             .collect()
+    }
+
+    /// Execute application-defined partitions across the participant units in a plan.
+    ///
+    /// Partitions are assigned deterministically in index order using round-robin placement.
+    /// The application controls partition boundaries; arbitrary payload bytes are never split.
+    pub fn execute_partitioned(
+        &self,
+        plan: &ExecutionPlan,
+        workload_id: &str,
+        partitions: &[crate::runtime::WorkloadPartition],
+    ) -> Result<PartitionedExecutionReceipt, ExecutionError> {
+        if workload_id.is_empty() {
+            return Err(ExecutionError::EmptyWorkloadId);
+        }
+        if plan.workload_id != workload_id {
+            return Err(ExecutionError::WorkloadMismatch);
+        }
+        if plan.units.is_empty() || partitions.is_empty() {
+            return Err(ExecutionError::EmptyPlan);
+        }
+
+        let total = u32::try_from(partitions.len()).map_err(|_| ExecutionError::InvalidPartition)?;
+        let mut seen_ids = HashSet::with_capacity(partitions.len());
+        let mut seen_indices = HashSet::with_capacity(partitions.len());
+        let mut ordered = partitions.iter().collect::<Vec<_>>();
+        for partition in &ordered {
+            partition
+                .validate()
+                .map_err(|_| ExecutionError::InvalidPartition)?;
+            if partition.workload_id != workload_id || partition.total != total {
+                return Err(ExecutionError::InvalidPartition);
+            }
+            if !seen_ids.insert(partition.partition_id.as_str()) {
+                return Err(ExecutionError::DuplicatePartitionId);
+            }
+            if !seen_indices.insert(partition.index) {
+                return Err(ExecutionError::InvalidPartition);
+            }
+        }
+        if seen_indices.len() != partitions.len() {
+            return Err(ExecutionError::InvalidPartition);
+        }
+        ordered.sort_by_key(|partition| partition.index);
+
+        let mut requests = Vec::with_capacity(ordered.len());
+        for partition in ordered {
+            let unit = &plan.units[partition.index as usize % plan.units.len()];
+            let endpoint = self
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.participant_id == unit.participant_id)
+                .ok_or(ExecutionError::BackendRejected)?;
+            requests.push(crate::transport::ExecutionRequest {
+                request_id: format!(
+                    "{}:{}:{}",
+                    workload_id, partition.partition_id, unit.participant_id.id
+                ),
+                source_participant_id: self.source_participant_id.clone(),
+                workload: WorkItem {
+                    id: workload_id.to_owned(),
+                    payload: Vec::new(),
+                },
+                partition: Some(partition.clone()),
+                node_id: plan.node_id.clone(),
+                runtime: plan.runtime.clone(),
+                unit: unit.clone(),
+                endpoint: endpoint.clone(),
+            });
+        }
+
+        let responses = self.dispatch_requests(&requests)?;
+        let mut results = Vec::with_capacity(responses.len());
+        for (request, response) in requests.iter().zip(responses) {
+            if response.request_id != request.request_id
+                || response.status != crate::transport::ExecutionStatus::Completed
+            {
+                return Err(ExecutionError::BackendRejected);
+            }
+            let output = response
+                .output
+                .ok_or(ExecutionError::MissingPartitionOutput)?;
+            let partition = request
+                .partition
+                .as_ref()
+                .ok_or(ExecutionError::InvalidPartition)?;
+            results.push(PartitionResult {
+                partition_id: partition.partition_id.clone(),
+                partition_index: partition.index,
+                participant_id: request.unit.participant_id.clone(),
+                output,
+            });
+        }
+        results.sort_by_key(|result| result.partition_index);
+
+        Ok(PartitionedExecutionReceipt {
+            workload_id: workload_id.to_owned(),
+            node_id: plan.node_id.clone(),
+            results,
+        })
     }
 
     /// Execute a batch of independent workloads. Every job is dispatched to all participant
@@ -797,6 +927,7 @@ mod tests {
                 request_id: request.request_id,
                 status: self.0,
                 error: None,
+                output: None,
             })
         }
     }
@@ -972,6 +1103,7 @@ mod tests {
                     request_id: format!("{}:unexpected", request.workload.id),
                     status: crate::transport::ExecutionStatus::Completed,
                     error: None,
+                    output: None,
                 })
             }
         }

@@ -4,6 +4,7 @@ use crate::node::RuntimeSpec;
 use crate::resource::ResourceFragment;
 use crate::runtime::{
     Runtime, RuntimeContext, RuntimeError, RuntimeRegistry, RuntimeRegistryError,
+    WorkloadPartition,
 };
 use crate::transport::{ExecutionRequest, ExecutionResponse, ExecutionStatus};
 use std::sync::Arc;
@@ -17,6 +18,17 @@ pub trait ParticipantExecutor: Send + Sync {
         resources: ResourceFragment,
         workload: WorkItem,
     ) -> Result<(), EndpointExecutionError>;
+
+    fn execute_partition(
+        &self,
+        _participant_id: &Identity,
+        _node_id: &Identity,
+        _runtime: &RuntimeSpec,
+        _resources: ResourceFragment,
+        _partition: WorkloadPartition,
+    ) -> Result<Vec<u8>, EndpointExecutionError> {
+        Err(EndpointExecutionError::PartitionUnsupported)
+    }
 }
 
 pub struct RuntimeAdapter<R> {
@@ -44,13 +56,23 @@ impl<R: Runtime> ParticipantExecutor for RuntimeAdapter<R> {
     ) -> Result<(), EndpointExecutionError> {
         let context = RuntimeContext::new(participant_id.clone(), node_id.clone(), resources)
             .map_err(EndpointExecutionError::Runtime)?;
+        workload.validate().map_err(EndpointExecutionError::Runtime)?;
+        self.runtime.run(&context, workload).map_err(EndpointExecutionError::Runtime)
+    }
 
-        workload
-            .validate()
+    fn execute_partition(
+        &self,
+        participant_id: &Identity,
+        node_id: &Identity,
+        _runtime: &RuntimeSpec,
+        resources: ResourceFragment,
+        partition: WorkloadPartition,
+    ) -> Result<Vec<u8>, EndpointExecutionError> {
+        let context = RuntimeContext::new(participant_id.clone(), node_id.clone(), resources)
             .map_err(EndpointExecutionError::Runtime)?;
-
+        partition.validate().map_err(EndpointExecutionError::Runtime)?;
         self.runtime
-            .run(&context, workload)
+            .run_partition(&context, partition)
             .map_err(EndpointExecutionError::Runtime)
     }
 }
@@ -82,16 +104,29 @@ impl ParticipantExecutor for RegistryRuntimeAdapter {
             .registry
             .resolve(runtime)
             .map_err(EndpointExecutionError::RuntimeRegistry)?;
-
         let context = RuntimeContext::new(participant_id.clone(), node_id.clone(), resources)
             .map_err(EndpointExecutionError::Runtime)?;
+        workload.validate().map_err(EndpointExecutionError::Runtime)?;
+        runtime.run(&context, workload).map_err(EndpointExecutionError::Runtime)
+    }
 
-        workload
-            .validate()
+    fn execute_partition(
+        &self,
+        participant_id: &Identity,
+        node_id: &Identity,
+        runtime_spec: &RuntimeSpec,
+        resources: ResourceFragment,
+        partition: WorkloadPartition,
+    ) -> Result<Vec<u8>, EndpointExecutionError> {
+        let runtime = self
+            .registry
+            .resolve(runtime_spec)
+            .map_err(EndpointExecutionError::RuntimeRegistry)?;
+        let context = RuntimeContext::new(participant_id.clone(), node_id.clone(), resources)
             .map_err(EndpointExecutionError::Runtime)?;
-
+        partition.validate().map_err(EndpointExecutionError::Runtime)?;
         runtime
-            .run(&context, workload)
+            .run_partition(&context, partition)
             .map_err(EndpointExecutionError::Runtime)
     }
 }
@@ -148,24 +183,48 @@ impl<E: ParticipantExecutor> ParticipantExecutionEndpoint<E> {
         let workload = request.workload;
         let node_id = request.node_id;
         let runtime = request.runtime;
-
-        self.executor
-            .execute(
-                &self.participant_id,
-                &node_id,
-                &runtime,
-                request.unit.resources,
-                workload,
-            )
-            .map_err(|error| EndpointError::ExecutionFailed {
-                request_id: request_id.clone(),
-                error,
-            })?;
+        let output = match request.partition {
+            Some(partition) => {
+                if partition.workload_id != workload.id || !workload.payload.is_empty() {
+                    return Err(EndpointError::InvalidPartition);
+                }
+                Some(
+                    self.executor
+                        .execute_partition(
+                            &self.participant_id,
+                            &node_id,
+                            &runtime,
+                            request.unit.resources,
+                            partition,
+                        )
+                        .map_err(|error| EndpointError::ExecutionFailed {
+                            request_id: request_id.clone(),
+                            error,
+                        })?,
+                )
+            }
+            None => {
+                self.executor
+                    .execute(
+                        &self.participant_id,
+                        &node_id,
+                        &runtime,
+                        request.unit.resources,
+                        workload,
+                    )
+                    .map_err(|error| EndpointError::ExecutionFailed {
+                        request_id: request_id.clone(),
+                        error,
+                    })?;
+                None
+            }
+        };
 
         Ok(ExecutionResponse {
             request_id,
             status: ExecutionStatus::Completed,
             error: None,
+            output,
         })
     }
 }
@@ -193,6 +252,15 @@ fn validate_request(
 
     if request.workload.id.is_empty() {
         return Err(EndpointError::EmptyWorkloadId);
+    }
+
+    if let Some(partition) = &request.partition {
+        if partition.validate().is_err()
+            || partition.workload_id != request.workload.id
+            || !request.workload.payload.is_empty()
+        {
+            return Err(EndpointError::InvalidPartition);
+        }
     }
 
     if request.node_id.kind != Kind::LogicalNode || request.node_id.validate().is_err() {
@@ -235,6 +303,7 @@ fn validate_request(
 pub enum EndpointError {
     EmptyRequestId,
     EmptyWorkloadId,
+    InvalidPartition,
     InvalidParticipantIdentity,
     InvalidNodeIdentity,
     InvalidSourceIdentity,
@@ -249,6 +318,7 @@ pub enum EndpointError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointExecutionError {
     Rejected,
+    PartitionUnsupported,
     ExecutionFailed,
     Runtime(RuntimeError),
     RuntimeRegistry(RuntimeRegistryError),
@@ -305,6 +375,7 @@ mod tests {
                 id: "work-1".into(),
                 payload: vec![1, 2, 3],
             },
+            partition: None,
             node_id: Identity::new(Kind::LogicalNode),
             runtime: runtime_spec(),
             unit: ExecutionUnit {

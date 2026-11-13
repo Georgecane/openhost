@@ -17,7 +17,46 @@ impl Workload {
         if self.id.is_empty() {
             return Err(RuntimeError::EmptyWorkloadId);
         }
+        Ok(())
+    }
+}
 
+/// An application-defined, independently executable part of a workload.
+/// The payload is never split implicitly because its format and semantics belong to the application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadPartition {
+    pub workload_id: String,
+    pub partition_id: String,
+    pub index: u32,
+    pub total: u32,
+    pub payload: Vec<u8>,
+}
+
+impl WorkloadPartition {
+    pub fn new(
+        workload_id: impl Into<String>,
+        partition_id: impl Into<String>,
+        index: u32,
+        total: u32,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            workload_id: workload_id.into(),
+            partition_id: partition_id.into(),
+            index,
+            total,
+            payload,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.workload_id.is_empty()
+            || self.partition_id.is_empty()
+            || self.total == 0
+            || self.index >= self.total
+        {
+            return Err(RuntimeError::InvalidPartition);
+        }
         Ok(())
     }
 }
@@ -59,6 +98,16 @@ pub trait Runtime: Send + Sync {
     fn name(&self) -> &str;
 
     fn run(&self, context: &RuntimeContext, workload: Workload) -> Result<(), RuntimeError>;
+
+    /// Execute an explicitly partitioned unit and return its result bytes.
+    /// Existing runtimes reject partitioned jobs until they implement this method.
+    fn run_partition(
+        &self,
+        _context: &RuntimeContext,
+        _partition: WorkloadPartition,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        Err(RuntimeError::Unsupported)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +195,7 @@ pub enum RuntimeError {
     Unsupported,
     ExecutionFailed,
     Timeout,
+    InvalidPartition,
 }
 
 impl fmt::Display for RuntimeError {

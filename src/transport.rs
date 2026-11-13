@@ -3,6 +3,7 @@ use crate::execution::{ExecutionUnit, WorkItem};
 use crate::identity::{Identity, Kind};
 use crate::node::RuntimeSpec;
 use crate::resource::ResourceFragment;
+use crate::runtime::WorkloadPartition;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
@@ -50,6 +51,7 @@ pub struct ExecutionRequest {
     /// Authenticated identity expected from the caller when using TLS.
     pub source_participant_id: Option<Identity>,
     pub workload: WorkItem,
+    pub partition: Option<WorkloadPartition>,
     pub node_id: Identity,
     pub runtime: RuntimeSpec,
     pub unit: ExecutionUnit,
@@ -71,6 +73,7 @@ pub struct ExecutionResponse {
     pub request_id: String,
     pub status: ExecutionStatus,
     pub error: Option<String>,
+    pub output: Option<Vec<u8>>,
 }
 
 impl ExecutionResponse {
@@ -79,6 +82,19 @@ impl ExecutionResponse {
             request_id: request_id.into(),
             status: ExecutionStatus::Completed,
             error: None,
+            output: None,
+        }
+    }
+
+    pub fn completed_with_output(
+        request_id: impl Into<String>,
+        output: Vec<u8>,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            status: ExecutionStatus::Completed,
+            error: None,
+            output: Some(output),
         }
     }
 
@@ -87,6 +103,7 @@ impl ExecutionResponse {
             request_id: request_id.into(),
             status: ExecutionStatus::Failed,
             error: Some(error.into()),
+            output: None,
         }
     }
 }
@@ -680,6 +697,14 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
     if request.workload.id.is_empty() {
         return Err(TransportError::EmptyWorkloadId);
     }
+    if let Some(partition) = &request.partition {
+        if partition.validate().is_err()
+            || partition.workload_id != request.workload.id
+            || !request.workload.payload.is_empty()
+        {
+            return Err(TransportError::MalformedPartition);
+        }
+    }
     if request.node_id.kind != Kind::LogicalNode || request.node_id.validate().is_err() {
         return Err(TransportError::InvalidNodeIdentity);
     }
@@ -710,7 +735,7 @@ fn validate_transport_request(request: &ExecutionRequest) -> Result<(), Transpor
 }
 
 const MAX_FRAME_SIZE: u64 = 64 * 1024 * 1024;
-const PROTOCOL_VERSION: u8 = 1;
+const PROTOCOL_VERSION: u8 = 2;
 
 fn write_request<S: Write>(
     stream: &mut S,
@@ -728,6 +753,17 @@ fn write_request<S: Write>(
     }
     write_string(&mut payload, &request.workload.id)?;
     write_bytes(&mut payload, &request.workload.payload)?;
+    match &request.partition {
+        Some(partition) => {
+            payload.push(1);
+            write_string(&mut payload, &partition.workload_id)?;
+            write_string(&mut payload, &partition.partition_id)?;
+            payload.extend_from_slice(&partition.index.to_be_bytes());
+            payload.extend_from_slice(&partition.total.to_be_bytes());
+            write_bytes(&mut payload, &partition.payload)?;
+        }
+        None => payload.push(0),
+    }
     write_identity(&mut payload, &request.node_id)?;
     write_string(&mut payload, &request.runtime.name)?;
     write_string(&mut payload, &request.runtime.version)?;
@@ -757,6 +793,17 @@ fn read_request<S: Read>(stream: &mut S) -> Result<ExecutionRequest, TransportEr
         workload: WorkItem {
             id: reader.string()?,
             payload: reader.bytes()?,
+        },
+        partition: match reader.byte()? {
+            0 => None,
+            1 => Some(WorkloadPartition {
+                workload_id: reader.string()?,
+                partition_id: reader.string()?,
+                index: reader.u32()?,
+                total: reader.u32()?,
+                payload: reader.bytes()?,
+            }),
+            _ => return Err(TransportError::MalformedFrame),
         },
         node_id: reader.identity()?,
         runtime: RuntimeSpec {
@@ -792,6 +839,13 @@ fn write_response<S: Write>(
         }
         None => payload.push(0),
     }
+    match &response.output {
+        Some(output) => {
+            payload.push(1);
+            write_bytes(&mut payload, output)?;
+        }
+        None => payload.push(0),
+    }
     write_frame(stream, &payload)
 }
 
@@ -809,11 +863,17 @@ fn read_response<S: Read>(stream: &mut S) -> Result<ExecutionResponse, Transport
         1 => Some(reader.string()?),
         _ => return Err(TransportError::MalformedFrame),
     };
+    let output = match reader.byte()? {
+        0 => None,
+        1 => Some(reader.bytes()?),
+        _ => return Err(TransportError::MalformedFrame),
+    };
     reader.finish()?;
     Ok(ExecutionResponse {
         request_id,
         status,
         error,
+        output,
     })
 }
 
@@ -1044,6 +1104,7 @@ pub enum TransportError {
     ResponseIdMismatch,
     FrameTooLarge,
     MalformedFrame,
+    MalformedPartition,
 }
 
 impl fmt::Display for TransportError {
@@ -1071,6 +1132,15 @@ impl Transport for LoopbackTransport {
             return Err(TransportError::EmptyWorkloadId);
         }
 
+        if let Some(partition) = &request.partition {
+            if partition.validate().is_err()
+                || partition.workload_id != request.workload.id
+                || !request.workload.payload.is_empty()
+            {
+                return Err(TransportError::MalformedPartition);
+            }
+        }
+
         if request.node_id.kind != Kind::LogicalNode {
             return Err(TransportError::InvalidNodeIdentity);
         }
@@ -1095,6 +1165,7 @@ impl Transport for LoopbackTransport {
             request_id: request.request_id,
             status: ExecutionStatus::Dispatched,
             error: None,
+            output: None,
         })
     }
 }
@@ -1127,6 +1198,7 @@ mod tests {
                 },
             },
             endpoint: ExecutionEndpoint::new(participant_id, "loopback://participant-1").unwrap(),
+            partition: None,
         }
     }
 

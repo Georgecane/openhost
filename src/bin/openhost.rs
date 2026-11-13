@@ -429,6 +429,7 @@ fn run_exec(args: &[String]) {
         request_id: format!("{}:{}", workload.id, participant_id.id),
         source_participant_id: None,
         workload,
+        partition: None,
         node_id,
         runtime: RuntimeSpec::new(runtime_name, runtime_ver),
         unit,
